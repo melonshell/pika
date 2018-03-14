@@ -11,7 +11,7 @@
 
 #include "pink/include/redis_conn.h"
 #include "pink/include/pink_thread.h"
-#include "pika_command.h"
+#include "include/pika_command.h"
 
 class PikaWorkerSpecificData;
 
@@ -20,14 +20,17 @@ class PikaClientConn: public pink::RedisConn {
   PikaClientConn(int fd, std::string ip_port, pink::ServerThread *server_thread,
                  void* worker_specific_data);
   virtual ~PikaClientConn() {}
-  virtual int DealMessage();
+  int DealMessage(PikaCmdArgsType& argv, std::string* response) override;
+
+  bool IsPubSub() { return is_pubsub_; }
+  void SetIsPubSub(bool is_pubsub) { is_pubsub_ = is_pubsub; }
 
  private:
   pink::ServerThread* const server_thread_;
   CmdTable* const cmds_table_;
+  bool is_pubsub_;
 
-  std::string DoCmd(const std::string& opt);
-  std::string RestoreArgs();
+  std::string DoCmd(PikaCmdArgsType& argv, const std::string& opt);
 
   // Auth related
   class AuthStat {

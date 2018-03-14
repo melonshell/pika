@@ -6,12 +6,12 @@
 
 #include "slash/include/slash_string.h"
 #include "slash/include/rsync.h"
-#include "pika_conf.h"
-#include "pika_admin.h"
-#include "pika_server.h"
-#include "pika_slot.h"
-#include "pika_version.h"
-#include "build_version.h"
+#include "include/pika_conf.h"
+#include "include/pika_admin.h"
+#include "include/pika_server.h"
+#include "include/pika_slot.h"
+#include "include/build_version.h"
+#include "include/pika_version.h"
 
 #include <sys/utsname.h>
 #ifdef TCMALLOC_EXTENSION
@@ -80,24 +80,49 @@ void SlaveofCmd::DoInitial(PikaCmdArgsType &argv, const CmdInfo* const ptr_info)
 }
 
 void SlaveofCmd::Do() {
-  if (is_noone_) {
+  // In master-salve mode
+  if (!g_pika_server->DoubleMasterMode()) {
+    // Check if we are already connected to the specified master
+    if ((master_ip_ == "127.0.0.1" || g_pika_server->master_ip() == master_ip_) &&
+        g_pika_server->master_port() == master_port_) {
+      res_.SetRes(CmdRes::kOk);
+      return;
+    }
+
     // Stop rsync
     LOG(INFO) << "start slaveof, stop rsync first";
     slash::StopRsync(g_pika_conf->db_sync_path());
-
     g_pika_server->RemoveMaster();
-    g_pika_server->SetForceFullSync(false);
-    res_.SetRes(CmdRes::kOk);
-    return;
-  }
-  if (have_offset_) {
-    // Before we send the trysync command, we need purge current logs older than the sync point
-    if (filenum_ > 0) {
-      g_pika_server->PurgeLogs(filenum_ - 1, true, true);
+
+    if (is_noone_) {
+      res_.SetRes(CmdRes::kOk);
+      return;
     }
-    g_pika_server->logger_->SetProducerStatus(filenum_, pro_offset_);
+
+    if (have_offset_) {
+      // Before we send the trysync command, we need purge current logs older than the sync point
+      if (filenum_ > 0) {
+        g_pika_server->PurgeLogs(filenum_ - 1, true, true);
+      }
+      g_pika_server->logger_->SetProducerStatus(filenum_, pro_offset_);
+    }
   }
+
+  // The conf file already configured double-master item, but now this
+  // connection maybe broken and need to rsync all of binlog
+  if (g_pika_server->DoubleMasterMode() && g_pika_server->repl_state() == PIKA_REPL_NO_CONNECT) {
+    if (g_pika_server->IsDoubleMaster(master_ip_, master_port_)) {
+      g_pika_server->PurgeLogs(0, true, true);
+      g_pika_server->SetForceFullSync(true);
+      g_pika_conf->SetReadonly(true);
+    } else {
+      res_.SetRes(CmdRes::kErrOther, "In double master mode, can not set other server as the peer-master");
+      return;
+    }
+  }
+
   bool sm_ret = g_pika_server->SetMaster(master_ip_, master_port_);
+  
   if (sm_ret) {
     res_.SetRes(CmdRes::kOk);
   } else {
@@ -148,6 +173,12 @@ void TrysyncCmd::Do() {
     // Create Sender failed, delete the slave
     g_pika_server->DeleteSlave(slave_ip_, slave_port_);
 
+    // In the double master mode, need to remove the peer-master
+    if (g_pika_server->DoubleMasterMode() && g_pika_server->IsDoubleMaster(slave_ip_, slave_port_) && filenum_ != UINT32_MAX) {
+      g_pika_server->RemoveMaster();
+      LOG(INFO) << "Because the invalid filenum and offset, close the connection between the peer-masters";
+    }
+
     if (status.IsIncomplete()) {
       res_.AppendString(kInnerReplWait);
     } else {
@@ -160,6 +191,61 @@ void TrysyncCmd::Do() {
     LOG(WARNING) << "slave already exist, slave ip: " << slave_ip_
       << "slave port: " << slave_port_;
     res_.SetRes(CmdRes::kErrOther, "AlreadyExist");
+  }
+}
+
+void InternalTrysyncCmd::DoInitial(PikaCmdArgsType &argv,
+                                   const CmdInfo* const ptr_info) {
+  if (!ptr_info->CheckArg(argv.size())) {
+    res_.SetRes(CmdRes::kWrongNum, kCmdNameTrysync);
+    return;
+  }
+  PikaCmdArgsType::iterator it = argv.begin() + 1; //Remember the first args is the opt name
+  hub_ip_ = *it++;
+
+  std::string str_hub_port = *it++;
+  if (!slash::string2l(str_hub_port.data(), str_hub_port.size(), &hub_port_) ||
+      hub_port_ <= 0) {
+    res_.SetRes(CmdRes::kInvalidInt);
+    return;
+  }
+
+  std::string str_filenum = *it++;
+  if (!slash::string2l(str_filenum.data(), str_filenum.size(), &filenum_) ||
+      filenum_ < 0) {
+    res_.SetRes(CmdRes::kInvalidInt);
+    return;
+  }
+
+  std::string str_pro_offset = *it++;
+  if (!slash::string2l(str_pro_offset.data(), str_pro_offset.size(), &pro_offset_) ||
+      pro_offset_ < 0) {
+    res_.SetRes(CmdRes::kInvalidInt);
+    return;
+  }
+
+  send_most_recently_ = (*it == "1");
+}
+
+void InternalTrysyncCmd::Do() {
+  LOG(INFO) << "InternalTrysync, Hub ip: " << hub_ip_ << "Hub port:" << hub_port_
+    << " filenum: " << filenum_ << " pro_offset: " << pro_offset_;
+
+  Status status = g_pika_server->pika_hub_manager_->AddHub(
+      hub_ip_, hub_port_ + 1000,
+      filenum_, pro_offset_,
+      send_most_recently_);
+
+  if (!status.ok()) {
+    LOG(WARNING) << "hub offset is larger than mine, slave ip: " << hub_ip_
+      << "slave port:" << hub_port_
+      << " filenum: " << filenum_ << " pro_offset_: " << pro_offset_ << " "
+      << status.ToString();
+    // treat errors as InvalidOffset
+    res_.SetRes(CmdRes::kErrOther, "InvalidOffset");
+  } else {
+    res_.SetRes(CmdRes::kOk);
+    LOG(INFO) << "Send OK to Hub";
   }
 }
 
@@ -204,7 +290,6 @@ void BgsaveCmd::Do() {
       info.s_start_time.c_str(), info.filenum, info.offset);
   res_.AppendContent(buf);
 }
-
 void BgsaveoffCmd::DoInitial(PikaCmdArgsType &argv, const CmdInfo* const ptr_info) {
   if (!ptr_info->CheckArg(argv.size())) {
     res_.SetRes(CmdRes::kWrongNum, kCmdNameBgsaveoff);
@@ -222,14 +307,35 @@ void BgsaveoffCmd::Do() {
 }
 
 void CompactCmd::DoInitial(PikaCmdArgsType &argv, const CmdInfo* const ptr_info) {
-  if (!ptr_info->CheckArg(argv.size())) {
+  if (!ptr_info->CheckArg(argv.size())
+    || argv.size() > 2) {
     res_.SetRes(CmdRes::kWrongNum, kCmdNameCompact);
     return;
+  }
+
+  if (argv.size() == 2) {
+    struct_type_ = slash::StringToLower(argv[1]);
   }
 }
 
 void CompactCmd::Do() {
-  nemo::Status s = g_pika_server->db()->Compact(nemo::kALL);
+  nemo::Status s;
+  if (struct_type_.empty()) {
+    s = g_pika_server->db()->Compact(nemo::kALL);
+  } else if (struct_type_ == "string") {
+    s = g_pika_server->db()->Compact(nemo::kKV_DB);
+  } else if (struct_type_ == "hash") {
+    s = g_pika_server->db()->Compact(nemo::kHASH_DB);
+  } else if (struct_type_ == "set") {
+    s = g_pika_server->db()->Compact(nemo::kSET_DB);
+  } else if (struct_type_ == "zset") {
+    s = g_pika_server->db()->Compact(nemo::kZSET_DB);
+  } else if (struct_type_ == "list") {
+    s = g_pika_server->db()->Compact(nemo::kLIST_DB);
+  } else {
+    res_.SetRes(CmdRes::kInvalidDbType);
+    return;
+  }
   if (s.ok()) {
     res_.SetRes(CmdRes::kOk);
   } else {
@@ -302,6 +408,37 @@ void FlushallCmd::Do() {
     res_.SetRes(CmdRes::kOk);
   } else {
     res_.SetRes(CmdRes::kErrOther, "There are some bgthread using db now, can not flushall");
+  }
+  g_pika_server->RWUnlock();
+}
+
+void FlushdbCmd::DoInitial(PikaCmdArgsType &argv, const CmdInfo* const ptr_info) {
+  if (!ptr_info->CheckArg(argv.size())) {
+    res_.SetRes(CmdRes::kWrongNum, kCmdNameFlushdb);
+    return;
+  }
+  std::string struct_type = slash::StringToLower(argv[1]);
+  if (struct_type == "string") {
+    db_name_ = "kv";
+  } else if (struct_type == "hash") {
+    db_name_ = "hash";
+  } else if (struct_type == "set") {
+    db_name_ = "set";
+  } else if (struct_type == "zset") {
+    db_name_ = "zset";
+  } else if (struct_type == "list") {
+    db_name_ = "list";
+  } else {
+    res_.SetRes(CmdRes::kInvalidDbType);
+  }
+}
+
+void FlushdbCmd::Do() {
+  g_pika_server->RWLockWriter();
+  if (g_pika_server->FlushDb(db_name_)) {
+    res_.SetRes(CmdRes::kOk);
+  } else {
+    res_.SetRes(CmdRes::kErrOther, "There are some bgthread using db now, can not flushdb");
   }
   g_pika_server->RWUnlock();
 }
@@ -394,11 +531,14 @@ void ShutdownCmd::Do() {
 const std::string InfoCmd::kAllSection = "all";
 const std::string InfoCmd::kServerSection = "server";
 const std::string InfoCmd::kClientsSection = "clients";
+const std::string InfoCmd::kHubSection = "hub";
 const std::string InfoCmd::kStatsSection = "stats";
+const std::string InfoCmd::kCPUSection = "cpu";
 const std::string InfoCmd::kReplicationSection = "replication";
 const std::string InfoCmd::kKeyspaceSection = "keyspace";
 const std::string InfoCmd::kLogSection = "log";
 const std::string InfoCmd::kDataSection = "data";
+const std::string InfoCmd::kDoubleMaster = "doublemaster";
 
 void InfoCmd::DoInitial(PikaCmdArgsType &argv, const CmdInfo* const ptr_info) {
   (void)ptr_info;
@@ -418,8 +558,12 @@ void InfoCmd::DoInitial(PikaCmdArgsType &argv, const CmdInfo* const ptr_info) {
     info_section_ = kInfoServer;
   } else if (argv[1] == kClientsSection) {
     info_section_ = kInfoClients;
+  } else if (argv[1] == kHubSection) {
+    info_section_ = kInfoHub;
   } else if (argv[1] == kStatsSection) {
     info_section_ = kInfoStats;
+  } else if (argv[1] == kCPUSection) {
+    info_section_ = kInfoCPU;
   } else if (argv[1] == kReplicationSection) {
     info_section_ = kInfoReplication;
   } else if (argv[1] == kKeyspaceSection) {
@@ -439,7 +583,9 @@ void InfoCmd::DoInitial(PikaCmdArgsType &argv, const CmdInfo* const ptr_info) {
     info_section_ = kInfoLog;
   } else if (argv[1] == kDataSection) {
     info_section_ = kInfoData;
-  }else {
+  } else if (argv[1] == kDoubleMaster) {
+    info_section_ = kInfoDoubleMaster;
+  } else {
     info_section_ = kInfoErr;
   }
   if (argc != 2) {
@@ -459,11 +605,17 @@ void InfoCmd::Do() {
       info.append("\r\n");
       InfoClients(info);
       info.append("\r\n");
+      InfoHub(info);
+      info.append("\r\n");
       InfoStats(info);
+      info.append("\r\n");
+      InfoCPU(info);
       info.append("\r\n");
       InfoReplication(info);
       info.append("\r\n");
       InfoKeyspace(info);
+      info.append("\r\n");
+      InfoDoubleMaster(info);
       break;
     case kInfoServer:
       InfoServer(info);
@@ -471,8 +623,14 @@ void InfoCmd::Do() {
     case kInfoClients:
       InfoClients(info);
       break;
+    case kInfoHub:
+      InfoHub(info);
+      break;
     case kInfoStats:
       InfoStats(info);
+      break;
+    case kInfoCPU:
+      InfoCPU(info);
       break;
     case kInfoReplication:
       InfoReplication(info);
@@ -489,6 +647,9 @@ void InfoCmd::Do() {
       break;
     case kInfoData:
       InfoData(info);
+      break;
+    case kInfoDoubleMaster:
+      InfoDoubleMaster(info);
       break;
     default:
       //kInfoErr is nothing
@@ -528,6 +689,7 @@ void InfoCmd::InfoServer(std::string &info) {
   tmp_stream << "uptime_in_seconds:" << (current_time_s - g_pika_server->start_time_s()) << "\r\n";
   tmp_stream << "uptime_in_days:" << (current_time_s / (24*3600) - g_pika_server->start_time_s() / (24*3600) + 1) << "\r\n";
   tmp_stream << "config_file:" << g_pika_conf->conf_path() << "\r\n";
+  tmp_stream << "server_id:" << g_pika_conf->server_id() << "\r\n";
 
   info.append(tmp_stream.str());
 }
@@ -536,6 +698,14 @@ void InfoCmd::InfoClients(std::string &info) {
   std::stringstream tmp_stream;
   tmp_stream << "# Clients\r\n";
   tmp_stream << "connected_clients:" << g_pika_server->ClientList() << "\r\n";
+
+  info.append(tmp_stream.str());
+}
+
+void InfoCmd::InfoHub(std::string &info) {
+  std::stringstream tmp_stream;
+  tmp_stream << "# Hub\r\n";
+  tmp_stream << g_pika_server->pika_hub_manager_->StatusToString() << "\r\n";
 
   info.append(tmp_stream.str());
 }
@@ -556,6 +726,10 @@ void InfoCmd::InfoStats(std::string &info) {
   bool is_reloading = g_pika_server->GetSlotsreloading();
   tmp_stream << "is_slots_reloading:" << (is_reloading ? "Yes, " : "No, ") << bgslotsreload_info.s_start_time << ", "
                                 << (is_reloading ? (current_time_s - bgslotsreload_info.start_time) : 0) << "\r\n";
+  PikaServer::BGSlotsCleanup bgslotscleanup_info = g_pika_server->bgslots_cleanup();
+  bool is_cleanuping = g_pika_server->GetSlotscleanuping();
+  tmp_stream << "is_slots_cleanuping:" << (is_cleanuping ? "Yes, " : "No, ") << bgslotscleanup_info.s_start_time << ", "
+                                << (is_cleanuping ? (current_time_s - bgslotscleanup_info.start_time) : 0) << "\r\n";
   PikaServer::KeyScanInfo key_scan_info = g_pika_server->key_scan_info();
   bool is_scaning = g_pika_server->key_scaning();
   tmp_stream << "is_scaning_keyspace:" << (is_scaning ? ("Yes, " + key_scan_info.s_start_time) + "," : "No");
@@ -570,6 +744,31 @@ void InfoCmd::InfoStats(std::string &info) {
   info.append(tmp_stream.str());
 }
 
+void InfoCmd::InfoCPU(std::string &info) {
+  struct rusage self_ru, c_ru;
+  getrusage(RUSAGE_SELF, &self_ru);
+  getrusage(RUSAGE_CHILDREN, &c_ru);
+  std::stringstream tmp_stream;
+  tmp_stream << "# CPU\r\n";
+  tmp_stream << "used_cpu_sys:" <<
+    setiosflags(std::ios::fixed) << std::setprecision(2) <<
+    (float)self_ru.ru_stime.tv_sec+(float)self_ru.ru_stime.tv_usec/1000000 <<
+    "\r\n";
+  tmp_stream << "used_cpu_user:" <<
+    setiosflags(std::ios::fixed) << std::setprecision(2) <<
+    (float)self_ru.ru_utime.tv_sec+(float)self_ru.ru_utime.tv_usec/1000000 <<
+    "\r\n";
+  tmp_stream << "used_cpu_sys_children:" <<
+    setiosflags(std::ios::fixed) << std::setprecision(2) <<
+    (float)c_ru.ru_stime.tv_sec+(float)c_ru.ru_stime.tv_usec/1000000 <<
+    "\r\n";
+  tmp_stream << "used_cpu_user_children:" <<
+    setiosflags(std::ios::fixed) << std::setprecision(2) <<
+    (float)c_ru.ru_utime.tv_sec+(float)c_ru.ru_utime.tv_usec/1000000 <<
+    "\r\n";
+  info.append(tmp_stream.str());
+}
+
 void InfoCmd::InfoReplication(std::string &info) {
   int host_role = g_pika_server->role();
   std::stringstream tmp_stream;
@@ -578,7 +777,12 @@ void InfoCmd::InfoReplication(std::string &info) {
     case PIKA_ROLE_SINGLE :
     case PIKA_ROLE_MASTER : tmp_stream << "MASTER)\r\nrole:master\r\n"; break;
     case PIKA_ROLE_SLAVE : tmp_stream << "SLAVE)\r\nrole:slave\r\n"; break;
-    case PIKA_ROLE_MASTER | PIKA_ROLE_SLAVE : tmp_stream << "MASTER/SLAVE)\r\nrole:slave\r\n"; break;
+    case PIKA_ROLE_DOUBLE_MASTER :
+        if (g_pika_server->DoubleMasterMode()) {
+          tmp_stream << "DOUBLEMASTER)\r\nrole:double_master\r\n"; break;
+        } else {
+          tmp_stream << "MASTER/SLAVE)\r\nrole:slave\r\n"; break;
+        }
     default: info.append("ERR: server role is error\r\n"); return;
   }
 
@@ -589,6 +793,7 @@ void InfoCmd::InfoReplication(std::string &info) {
       tmp_stream << "master_host:" << g_pika_server->master_ip() << "\r\n";
       tmp_stream << "master_port:" << g_pika_server->master_port() << "\r\n";
       tmp_stream << "master_link_status:" << (g_pika_server->repl_state() == PIKA_REPL_CONNECTED ? "up" : "down") << "\r\n";
+      tmp_stream << "slave_priority:" << g_pika_conf->slave_priority() << "\r\n";
       tmp_stream << "slave_read_only:" << g_pika_conf->readonly() << "\r\n";
       tmp_stream << "repl_state: " << (g_pika_server->repl_state()) << "\r\n";
       break;
@@ -602,6 +807,36 @@ void InfoCmd::InfoReplication(std::string &info) {
     case PIKA_ROLE_MASTER :
       tmp_stream << "connected_slaves:" << g_pika_server->GetSlaveListString(slaves_list_str) << "\r\n" << slaves_list_str;
   }
+
+  info.append(tmp_stream.str());
+}
+
+void InfoCmd::InfoDoubleMaster(std::string &info) {
+  int host_role = g_pika_server->role();
+  std::stringstream tmp_stream;
+  tmp_stream << "# DoubleMaster(";
+  switch (host_role) {
+    case PIKA_ROLE_SINGLE :
+    case PIKA_ROLE_MASTER : tmp_stream << "MASTER)\r\nrole:master\r\n"; break;
+    case PIKA_ROLE_SLAVE : tmp_stream << "SLAVE)\r\nrole:slave\r\b"; break;
+    case PIKA_ROLE_DOUBLE_MASTER :
+        if (g_pika_server->DoubleMasterMode()) {
+          tmp_stream << "DOUBLEMASTER)\r\nrole:double_master\r\n"; break;
+        } else {
+          tmp_stream << "MASTER/SLAVE)\r\nrole:slave\r\n"; break;
+        }
+    default : info.append("ERR: server role is error\r\n"); return;
+  }
+
+  tmp_stream << "the peer-master host:" << g_pika_conf->double_master_ip() << "\r\n";
+  tmp_stream << "the peer-master port:" << g_pika_conf->double_master_port() << "\r\n";
+  tmp_stream << "the peer-master server_id:" << g_pika_server->DoubleMasterSid() << "\r\n";
+  tmp_stream << "double_master_mode: " << (g_pika_server->DoubleMasterMode() ? "True" : "False") << "\r\n";
+  tmp_stream << "repl_state: " << (g_pika_server->repl_state()) << "\r\n";
+  uint64_t double_recv_offset;
+  uint32_t double_recv_num;
+  g_pika_server->logger_->GetDoubleRecvInfo(&double_recv_num, &double_recv_offset);
+  tmp_stream << "double_master_recv_info: filenum " << double_recv_num << " offset " << double_recv_offset << "\r\n";
 
   info.append(tmp_stream.str());
 }
@@ -754,6 +989,18 @@ void ConfigCmd::ConfigGet(std::string &ret) {
       ret = "*2\r\n";
       EncodeString(&ret, "port");
       EncodeInt32(&ret, g_pika_conf->port());
+  } else if (get_item == "double-master-ip") {
+      ret = "*2\r\n";
+      EncodeString(&ret, "double-master-ip");
+      EncodeString(&ret, g_pika_conf->double_master_ip());
+  } else if (get_item == "double-master-port") {
+      ret = "*2\r\n";
+      EncodeString(&ret, "double-master-port");
+      EncodeInt32(&ret, g_pika_conf->double_master_port());
+  } else if (get_item == "double-master-sid") {
+      ret = "*2\r\n";
+      EncodeString(&ret, "double-master-sid");
+      EncodeString(&ret, g_pika_conf->double_master_sid());
   } else if (get_item == "thread-num") {
       ret = "*2\r\n";
       EncodeString(&ret, "thread-num");
@@ -906,10 +1153,20 @@ void ConfigCmd::ConfigGet(std::string &ret) {
     ret = "*2\r\n";
     EncodeString(&ret, "slaveof");
     EncodeString(&ret, g_pika_conf->slaveof());
+  } else if (get_item == "slave-priority") {
+    ret = "*2\r\n";
+    EncodeString(&ret, "slave-priority");
+    EncodeInt32(&ret, g_pika_conf->slave_priority());
   } else if (get_item == "*") {
-    ret = "*78\r\n";
+    ret = "*86\r\n";
     EncodeString(&ret, "port");
     EncodeInt32(&ret, g_pika_conf->port());
+    EncodeString(&ret, "double-master-ip");
+    EncodeString(&ret, g_pika_conf->double_master_ip());
+    EncodeString(&ret, "double-master-port");
+    EncodeInt32(&ret, g_pika_conf->double_master_port());
+    EncodeString(&ret, "double-master-sid");
+    EncodeString(&ret, g_pika_conf->double_master_sid());
     EncodeString(&ret, "thread-num");
     EncodeInt32(&ret, g_pika_conf->thread_num());
     EncodeString(&ret, "sync-thread-num");
@@ -986,6 +1243,8 @@ void ConfigCmd::ConfigGet(std::string &ret) {
     EncodeString(&ret, g_pika_conf->network_interface());
     EncodeString(&ret, "slaveof");
     EncodeString(&ret, g_pika_conf->slaveof());
+    EncodeString(&ret, "slaveof-priority");
+    EncodeInt32(&ret, g_pika_conf->slave_priority());
   } else {
     ret = "*0\r\n";
   }
@@ -994,7 +1253,7 @@ void ConfigCmd::ConfigGet(std::string &ret) {
 void ConfigCmd::ConfigSet(std::string& ret) {
   std::string set_item = config_args_v_[1];
   if (set_item == "*") {
-    ret = "*18\r\n";
+    ret = "*19\r\n";
     EncodeString(&ret, "loglevel");
     EncodeString(&ret, "timeout");
     EncodeString(&ret, "requirepass");
@@ -1013,6 +1272,7 @@ void ConfigCmd::ConfigSet(std::string& ret) {
     EncodeString(&ret, "db-sync-speed");
     EncodeString(&ret, "compact-cron");
     EncodeString(&ret, "compact-interval");
+    EncodeString(&ret, "slave-priority");
     return;
   }
   std::string value = config_args_v_[2];
@@ -1068,6 +1328,13 @@ void ConfigCmd::ConfigSet(std::string& ret) {
       return;
     }
     g_pika_conf->SetExpireDumpDays(ival);
+    ret = "+OK\r\n";
+  } else if (set_item == "slave-priority") {
+     if (!slash::string2l(value.data(), value.size(), &ival)) {
+      ret = "-ERR Invalid argument " + value + " for CONFIG SET 'slave-priority'\r\n";
+      return;
+    }
+    g_pika_conf->SetSlavePriority(ival);
     ret = "+OK\r\n";
   } else if (set_item == "expire-logs-days") {
     if (!slash::string2l(value.data(), value.size(), &ival)) {

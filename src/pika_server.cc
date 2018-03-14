@@ -15,21 +15,23 @@
 #include <iostream>
 #include <iterator>
 #include <ctime>
+#include <algorithm>
 
 #include "slash/include/env.h"
 #include "slash/include/rsync.h"
 #include "slash/include/slash_string.h"
 #include "pink/include/bg_thread.h"
-#include "pika_server.h"
-#include "pika_conf.h"
-#include "pika_slot.h"
-#include "pika_dispatch_thread.h"
+#include "include/pika_server.h"
+#include "include/pika_conf.h"
+#include "include/pika_slot.h"
+#include "include/pika_dispatch_thread.h"
 
 extern PikaConf *g_pika_conf;
 
 PikaServer::PikaServer() :
   ping_thread_(NULL),
   exit_(false),
+  binlog_io_error_(false),
   have_scheduled_crontask_(false),
   last_check_compact_time_({0, 0}),
   sid_(0),
@@ -39,6 +41,8 @@ PikaServer::PikaServer() :
   repl_state_(PIKA_REPL_NO_CONNECT),
   role_(PIKA_ROLE_SINGLE),
   force_full_sync_(false),
+  double_master_sid_(0),
+  double_master_mode_(false),
   bgsave_engine_(NULL),
   purging_(false),
   binlogbg_exit_(false),
@@ -56,16 +60,8 @@ PikaServer::PikaServer() :
   }
   // Create nemo handle
   nemo::Options option;
+  NemoOptionInit(&option);
 
-  option.write_buffer_size = g_pika_conf->write_buffer_size();
-  option.target_file_size_base = g_pika_conf->target_file_size_base();
-  option.max_background_flushes = g_pika_conf->max_background_flushes();
-  option.max_background_compactions = g_pika_conf->max_background_compactions();
-  option.max_open_files = g_pika_conf->max_cache_files();
-  option.max_bytes_for_level_multiplier = g_pika_conf->max_bytes_for_level_multiplier();
-	if (g_pika_conf->compression() == "none") {
-		 option.compression = false;
-  }
   std::string db_path = g_pika_conf->db_path();
   LOG(INFO) << "Prepare DB...";
   db_ = std::shared_ptr<nemo::Nemo>(new nemo::Nemo(db_path, option));
@@ -89,9 +85,12 @@ PikaServer::PikaServer() :
   pika_dispatch_thread_ = new PikaDispatchThread(ips, port_, worker_num_, 3000,
                                                  worker_queue_limit);
   pika_binlog_receiver_thread_ = new PikaBinlogReceiverThread(ips, port_ + 1000, 1000);
+  pika_hub_manager_ = new PikaHubManager(ips, port_ + 1100, 1000);
   pika_heartbeat_thread_ = new PikaHeartbeatThread(ips, port_ + 2000, 1000);
   pika_trysync_thread_ = new PikaTrysyncThread();
   monitor_thread_ = new PikaMonitorThread();
+  pika_pubsub_thread_ = new pink::PubSubThread();
+  slotsmgrt_sender_thread_ = new SlotsMgrtSenderThread();
 
   //for (int j = 0; j < g_pika_conf->binlogbg_thread_num; j++) {
   for (int j = 0; j < g_pika_conf->sync_thread_num(); j++) {
@@ -100,6 +99,11 @@ PikaServer::PikaServer() :
 
   pthread_rwlock_init(&state_protector_, NULL);
   logger_ = new Binlog(g_pika_conf->log_path(), g_pika_conf->binlog_file_size());
+
+  uint64_t double_recv_offset;
+  uint32_t double_recv_num;
+  logger_->GetDoubleRecvInfo(&double_recv_num, &double_recv_offset);
+  LOG(INFO) << "double recv info: filenum " << double_recv_num << " offset " << double_recv_offset;
 }
 
 PikaServer::~PikaServer() {
@@ -121,9 +125,12 @@ PikaServer::~PikaServer() {
   }
   }
 
+  delete slotsmgrt_sender_thread_;
   delete pika_trysync_thread_;
   delete ping_thread_;
+  delete pika_hub_manager_;
   delete pika_binlog_receiver_thread_;
+  delete pika_pubsub_thread_;
 
   binlogbg_exit_ = true;
   std::vector<BinlogBGWorker*>::iterator binlogbg_iter = binlogbg_workers_.begin();
@@ -138,7 +145,6 @@ PikaServer::~PikaServer() {
   StopKeyScan();
   key_scan_thread_.StopThread();
 
-  DestoryCmdInfoTable();
   delete logger_;
   db_.reset();
   pthread_rwlock_destroy(&state_protector_);
@@ -227,20 +233,20 @@ bool PikaServer::ServerInit() {
 
 }
 
-void PikaServer::Cleanup() {
-  // shutdown server
-  if (g_pika_conf->daemonize()) {
-    unlink(g_pika_conf->pidfile().c_str());
+void PikaServer::NemoOptionInit(nemo::Options* option) {
+  option->write_buffer_size = g_pika_conf->write_buffer_size();
+  option->target_file_size_base = g_pika_conf->target_file_size_base();
+  option->max_background_flushes = g_pika_conf->max_background_flushes();
+  option->max_background_compactions = g_pika_conf->max_background_compactions();
+  option->max_open_files = g_pika_conf->max_cache_files();
+  option->max_bytes_for_level_multiplier = g_pika_conf->max_bytes_for_level_multiplier();
+  if (g_pika_conf->compression() == "none") {
+    option->compression = nemo::Options::CompressionType::kNoCompression;
+  } else if (g_pika_conf->compression() == "snappy") {
+    option->compression = nemo::Options::CompressionType::kSnappyCompression;
+  } else if (g_pika_conf->compression() == "zlib") {
+    option->compression = nemo::Options::CompressionType::kZlibCompression;
   }
-
-//  DestoryCmdInfoTable();
-
-  //g_pika_server->shutdown = true;
-  //sleep(1);
-
-  delete this;
-  delete g_pika_conf;
-  ::google::ShutdownGoogleLogging();
 }
 
 void PikaServer::Start() {
@@ -257,6 +263,12 @@ void PikaServer::Start() {
     db_.reset();
     LOG(FATAL) << "Start BinlogReceiver Error: " << ret << (ret == pink::kBindError ? ": bind port conflict" : ": other error");
   }
+  ret = pika_hub_manager_->StartReceiver();
+  if (ret != pink::kSuccess) {
+    delete logger_;
+    db_.reset();
+    LOG(FATAL) << "Start HubBinlogReceiver Error: " << ret << (ret == pink::kBindError ? ": bind port conflict" : ": other error");
+  }
   ret = pika_heartbeat_thread_->StartThread();
   if (ret != pink::kSuccess) {
     delete logger_;
@@ -269,10 +281,16 @@ void PikaServer::Start() {
     db_.reset();
     LOG(FATAL) << "Start Trysync Error: " << ret << (ret == pink::kBindError ? ": bind port conflict" : ": other error");
   }
+  ret = pika_pubsub_thread_->StartThread();
+  if (ret != pink::kSuccess) {
+    delete logger_;
+    db_.reset();
+    LOG(FATAL) << "Start Pubsub Error: " << ret << (ret == pink::kBindError ? ": bind port conflict" : ": other error");
+  }
+
 
   time(&start_time_s_);
 
-  //SetMaster("127.0.0.1", 9221);
   std::string slaveof = g_pika_conf->slaveof();
   if (!slaveof.empty()) {
     int32_t sep = slaveof.find(":");
@@ -282,6 +300,20 @@ void PikaServer::Start() {
       LOG(FATAL) << "you will slaveof yourself as the config file, please check";
     } else {
       SetMaster(master_ip, master_port);
+    }
+  }
+
+
+  // Double master mode
+  if (!g_pika_conf->double_master_ip().empty()) {
+    std::string double_master_ip = g_pika_conf->double_master_ip();
+    int32_t double_master_port = g_pika_conf->double_master_port();
+    double_master_sid_ = std::stoi(g_pika_conf->double_master_sid());
+    if ((double_master_ip == "127.0.0.1" || double_master_ip == host_) && double_master_port == port_) {
+    LOG(FATAL) << "set yourself as the peer-master, please check";
+    } else {
+      double_master_mode_ = true;
+      SetMaster(double_master_ip, double_master_port);
     }
   }
 
@@ -295,7 +327,6 @@ void PikaServer::Start() {
     }
   }
   LOG(INFO) << "Goodbye...";
-  Cleanup();
 }
 
 void PikaServer::DeleteSlave(const std::string& ip, int64_t port) {
@@ -323,6 +354,9 @@ void PikaServer::DeleteSlave(const std::string& ip, int64_t port) {
   slash::RWLock l(&state_protector_, true);
   if (slave_num == 0) {
     role_ &= ~PIKA_ROLE_MASTER;
+    if (DoubleMasterMode()) {
+      role_ |= PIKA_ROLE_DOUBLE_MASTER;
+    }
   }
 }
 
@@ -348,6 +382,9 @@ void PikaServer::DeleteSlave(int fd) {
   slash::RWLock l(&state_protector_, true);
   if (slave_num == 0) {
     role_ &= ~PIKA_ROLE_MASTER;
+    if (DoubleMasterMode()) {
+      role_ |= PIKA_ROLE_DOUBLE_MASTER; 
+    }
   }
 }
 
@@ -366,7 +403,11 @@ bool PikaServer::ChangeDb(const std::string& new_path) {
   option.max_open_files = g_pika_conf->max_cache_files();
   option.max_bytes_for_level_multiplier = g_pika_conf->max_bytes_for_level_multiplier();
   if (g_pika_conf->compression() == "none") {
-    option.compression = false;
+    option.compression = nemo::Options::CompressionType::kNoCompression;
+  } else if (g_pika_conf->compression() == "snappy") {
+    option.compression = nemo::Options::CompressionType::kSnappyCompression;
+  } else if (g_pika_conf->compression() == "zlib") {
+    option.compression = nemo::Options::CompressionType::kZlibCompression;
   }
   std::string db_path = g_pika_conf->db_path();
   std::string tmp_path(db_path);
@@ -395,6 +436,15 @@ bool PikaServer::ChangeDb(const std::string& new_path) {
   return true;
 }
 
+bool PikaServer::IsDoubleMaster(const std::string master_ip, int master_port) {
+  if ((g_pika_conf->double_master_ip() == master_ip || host() == master_ip) && g_pika_conf->double_master_port() == master_port) {
+    return true;
+  } else {
+    return false;
+  }
+}
+
+
 void PikaServer::MayUpdateSlavesMap(int64_t sid, int32_t hb_fd) {
   slash::MutexLock l(&slave_mutex_);
   std::vector<SlaveItem>::iterator iter = slaves_.begin();
@@ -404,6 +454,13 @@ void PikaServer::MayUpdateSlavesMap(int64_t sid, int32_t hb_fd) {
       iter->hb_fd = hb_fd;
       iter->stage = SLAVE_ITEM_STAGE_TWO;
       LOG(INFO) << "New Master-Slave connection established successfully, Slave host: " << iter->ip_port;
+      
+      // If receive 'spci' from the peer-master
+      if (DoubleMasterMode() && repl_state_ == PIKA_REPL_NO_CONNECT && iter->sid == double_master_sid_) {
+        std::string double_master_ip = g_pika_conf->double_master_ip();
+        int32_t double_master_port = g_pika_conf->double_master_port();
+        SetMaster(double_master_ip, double_master_port);
+      }
       break;
     }
     iter++;
@@ -427,7 +484,11 @@ int64_t PikaServer::TryAddSlave(const std::string& ip, int64_t port) {
   // Not exist, so add new
   LOG(INFO) << "Add new slave, " << ip << ":" << port;
   SlaveItem s;
-  s.sid = GenSid();
+  if (DoubleMasterMode() && IsDoubleMaster(ip, port)) {  // Double master mode
+    s.sid = double_master_sid_;
+  } else {
+    s.sid = GenSid();
+  }
   s.ip_port = ip_port;
   s.port = port;
   s.hb_fd = -1;
@@ -480,6 +541,7 @@ int32_t PikaServer::GetSlaveListString(std::string& slave_list_str) {
       << ":ip=" << slave_ip_port.substr(0, slave_ip_port.find(":"))
       << ",port=" << slave_ip_port.substr(slave_ip_port.find(":")+1)
       << ",state=" << ((*iter).stage == SLAVE_ITEM_STAGE_TWO ? "online" : "offline")
+      << ",sid=" << (*iter).sid
       << "\r\n";
   }
   slave_list_str.assign(tmp_stream.str());
@@ -488,7 +550,11 @@ int32_t PikaServer::GetSlaveListString(std::string& slave_list_str) {
 
 void PikaServer::BecomeMaster() {
   slash::RWLock l(&state_protector_, true);
-  role_ |= PIKA_ROLE_MASTER;
+  if (double_master_mode_) {
+    role_ |= PIKA_ROLE_DOUBLE_MASTER;
+  } else {
+    role_ |= PIKA_ROLE_MASTER;
+  }
 }
 
 bool PikaServer::SetMaster(std::string& master_ip, int master_port) {
@@ -499,11 +565,18 @@ bool PikaServer::SetMaster(std::string& master_ip, int master_port) {
   if ((role_ ^ PIKA_ROLE_SLAVE) && repl_state_ == PIKA_REPL_NO_CONNECT) {
     master_ip_ = master_ip;
     master_port_ = master_port;
-    role_ |= PIKA_ROLE_SLAVE;
-    repl_state_ = PIKA_REPL_CONNECT;
-    LOG(INFO) << "open read-only mode";
-    g_pika_conf->SetReadonly(true);
-    return true;
+    if (!double_master_mode_) {
+      role_ |= PIKA_ROLE_SLAVE;
+      repl_state_ = PIKA_REPL_CONNECT;
+      LOG(INFO) << "Open read-only mode";
+      g_pika_conf->SetReadonly(true);
+      return true;
+    } else {
+      role_ |= PIKA_ROLE_DOUBLE_MASTER;
+      repl_state_ = PIKA_REPL_CONNECT;
+      LOG(INFO) << "In double-master mode, do not open read-only mode";
+      return true;
+    }
   }
   return false;
 }
@@ -588,7 +661,6 @@ void PikaServer::PlusMasterConnection() {
 bool PikaServer::ShouldAccessConnAsMaster(const std::string& ip) {
   slash::RWLock l(&state_protector_, false);
   DLOG(INFO) << "ShouldAccessConnAsMaster, repl_state_: " << repl_state_ << " ip: " << ip << " master_ip: " << master_ip_;
-//  if (repl_state_ != PIKA_REPL_NO_CONNECT && repl_state_ != PIKA_REPL_WAIT_DBSYNC && ip == master_ip_) {
   if ((repl_state_ == PIKA_REPL_CONNECTING || repl_state_ == PIKA_REPL_CONNECTED) &&
       ip == master_ip_) {
     return true;
@@ -619,7 +691,12 @@ void PikaServer::RemoveMaster() {
   {
   slash::RWLock l(&state_protector_, true);
   repl_state_ = PIKA_REPL_NO_CONNECT;
-  role_ &= ~PIKA_ROLE_SLAVE;
+  if (DoubleMasterMode()) {
+    role_ &= ~PIKA_ROLE_DOUBLE_MASTER;
+  } else {
+    role_ &= ~PIKA_ROLE_SLAVE;
+  }
+
   master_ip_ = "";
   master_port_ = -1;
   }
@@ -686,18 +763,26 @@ void PikaServer::DoDBSync(void* arg) {
 
 void PikaServer::DBSyncSendFile(const std::string& ip, int port) {
   std::string bg_path;
+  uint32_t binlog_filenum;
+  uint64_t binlog_offset;
   {
     slash::MutexLock l(&bgsave_protector_);
     bg_path = bgsave_info_.path;
+    binlog_filenum = bgsave_info_.filenum;
+    binlog_offset = bgsave_info_.offset;
   }
   // Get all files need to send
   std::vector<std::string> descendant;
-  if (!slash::GetChildren(bg_path, descendant)) {
-    LOG(WARNING) << "Get child directory when try to do db sync failed";
+  int ret = 0;
+  LOG(INFO) << "Start Send files in " << bg_path << " to " << ip;
+  ret = slash::GetChildren(bg_path, descendant);
+  if (ret != 0) {
+    LOG(WARNING) << "Get child directory when try to do sync failed, error: " << strerror(ret);
+    return;
   }
 
   // Iterate to send files
-  int ret = 0;
+  ret = 0;
   std::string local_path, target_path;
   std::string module = kDBSyncModule + "_" + slash::IpPortString(host_, port_);
   std::vector<std::string>::iterator it = descendant.begin();
@@ -709,6 +794,13 @@ void PikaServer::DBSyncSendFile(const std::string& ip, int port) {
     if (target_path == kBgsaveInfoFile) {
       continue;
     }
+
+    if (slash::IsDir(local_path) == 0 &&
+        local_path.back() != '/') {
+      local_path.push_back('/');
+      target_path.push_back('/');
+    }
+
     // We need specify the speed limit for every single file
     ret = slash::RsyncSendFile(local_path, target_path, remote);
 
@@ -743,6 +835,14 @@ void PikaServer::DBSyncSendFile(const std::string& ip, int port) {
   }
   if (0 == ret) {
     LOG(INFO) << "rsync send files success";
+    // If receiver is the peer-master, 
+    // need to update receive binlog info
+    if ((g_pika_conf->double_master_ip() == ip || host() == ip)
+        && (g_pika_conf->double_master_port() + 3000) == port) {
+      // Update Recv Info
+      logger_->SetDoubleRecvInfo(binlog_filenum, binlog_offset);
+      LOG(INFO) << "Update recv info filenum: " << binlog_filenum << " offset: " << binlog_offset;
+    }
   }
 }
 
@@ -753,7 +853,7 @@ Status PikaServer::AddBinlogSender(const std::string& ip, int64_t port,
     uint32_t filenum, uint64_t con_offset) {
   // Sanity check
   if (con_offset > logger_->file_size()) {
-    return Status::InvalidArgument("AddBinlogSender invalid offset");
+    return Status::InvalidArgument("AddBinlogSender invalid binlog offset");
   }
   uint32_t cur_filenum = 0;
   uint64_t cur_offset = 0;
@@ -772,6 +872,11 @@ Status PikaServer::AddBinlogSender(const std::string& ip, int64_t port,
   std::string confile = NewFileName(logger_->filename, filenum);
   if (!slash::FileExists(confile)) {
     // Not found binlog specified by filenum
+    // If in double-master mode, return error status
+    if (DoubleMasterMode() && IsDoubleMaster(ip, port) && filenum != UINT32_MAX) {
+      return Status::InvalidArgument("AddBinlogSender invalid binlog offset");
+    }
+
     TryDBSync(ip, port + 3000, cur_filenum);
     return Status::Incomplete("Bgsaving and DBSync first");
   }
@@ -842,9 +947,21 @@ bool PikaServer::InitBgsaveEngine() {
   return true;
 }
 
-bool PikaServer::RunBgsaveEngine(const std::string path) {
+bool PikaServer::RunBgsaveEngine() {
+  // Prepare for Bgsaving
+  if (!InitBgsaveEnv() || !InitBgsaveEngine()) {
+    ClearBgsave();
+    return false;
+  }
+  LOG(INFO) << "after prepare bgsave";
+  
+  BGSaveInfo info = bgsave_info();
+  LOG(INFO) << "   bgsave_info: path=" << info.path
+    << ",  filenum=" << info.filenum
+    << ", offset=" << info.offset;
+
   // Backup to tmp dir
-  nemo::Status nemo_s = bgsave_engine_->CreateNewBackup(path);
+  nemo::Status nemo_s = bgsave_engine_->CreateNewBackup(info.path);
   LOG(INFO) << "Create new backup finished.";
 
   if (!nemo_s.ok()) {
@@ -864,13 +981,6 @@ void PikaServer::Bgsave() {
     bgsave_info_.bgsaving = true;
   }
 
-  // Prepare for Bgsaving
-  if (!InitBgsaveEnv() || !InitBgsaveEngine()) {
-    ClearBgsave();
-    return;
-  }
-  LOG(INFO) << "after prepare bgsave";
-
   // Start new thread if needed
   bgsave_thread_.StartThread();
   bgsave_thread_.Schedule(&DoBgsave, static_cast<void*>(this));
@@ -878,12 +988,12 @@ void PikaServer::Bgsave() {
 
 void PikaServer::DoBgsave(void* arg) {
   PikaServer* p = static_cast<PikaServer*>(arg);
-  BGSaveInfo info = p->bgsave_info();
 
   // Do bgsave
-  bool ok = p->RunBgsaveEngine(info.path);
+  bool ok = p->RunBgsaveEngine();
 
   // Some output
+  BGSaveInfo info = p->bgsave_info();
   std::ofstream out;
   out.open(info.path + "/info", std::ios::in | std::ios::trunc);
   if (out.is_open()) {
@@ -935,8 +1045,8 @@ void PikaServer::Bgslotsreload() {
   LOG(INFO) << "Start slot reloading";
 
   // Start new thread if needed
-  bgsave_thread_.StartThread();
-  bgsave_thread_.Schedule(&DoBgslotsreload, static_cast<void*>(this));
+  bgslots_reload_thread_.StartThread();
+  bgslots_reload_thread_.Schedule(&DoBgslotsreload, static_cast<void*>(this));
 }
 
 void PikaServer::DoBgslotsreload(void* arg) {
@@ -969,6 +1079,90 @@ void PikaServer::DoBgslotsreload(void* arg) {
   }
   p->SetSlotsreloading(false);
   LOG(INFO) << "Finish slot reloading";
+}
+
+void PikaServer::Bgslotscleanup(std::vector<int> cleanupSlots) {
+  // Only one thread can go through
+  {
+    slash::MutexLock l(&bgsave_protector_);
+    if (bgslots_cleanup_.cleanuping || bgslots_reload_.reloading || bgsave_info_.bgsaving) {
+      return;
+    }
+    bgslots_cleanup_.cleanuping = true;
+  }
+
+  bgslots_cleanup_.start_time = time(NULL);
+  char s_time[32];
+  int len = strftime(s_time, sizeof(s_time), "%Y%m%d%H%M%S", localtime(&bgslots_cleanup_.start_time));
+  bgslots_cleanup_.s_start_time.assign(s_time, len);
+  bgslots_cleanup_.cursor = 0;
+  bgslots_cleanup_.pattern = "*";
+  bgslots_cleanup_.count = 100;
+  bgslots_cleanup_.cleanup_slots.swap(cleanupSlots);
+  LOG(INFO) << "Start slot cleanup!";
+
+  // Start new thread if needed
+  bgslots_cleanup_thread_.StartThread();
+  bgslots_cleanup_thread_.Schedule(&DoBgslotscleanup, static_cast<void*>(this));
+}
+
+void PikaServer::DoBgslotscleanup(void* arg) {
+  PikaServer* p = static_cast<PikaServer*>(arg);
+  BGSlotsCleanup cleanup = p->bgslots_cleanup();
+
+  // Do slotscleanup
+  std::vector<std::string> keys;
+  int64_t cursor_ret = -1;
+  std::vector<int> cleanupSlots(cleanup.cleanup_slots);
+  while(cursor_ret != 0 && p->GetSlotscleanuping()){
+    nemo::Status s = p->db()->Scan(cleanup.cursor, cleanup.pattern, cleanup.count, keys, &cursor_ret);
+    if (!s.ok()){
+      LOG(WARNING) << "BG slotscleanup error: " <<strerror(errno);
+      return;
+    }
+    std::string key_type;
+    std::vector<std::string>::const_iterator iter;
+    for (iter = keys.begin(); iter != keys.end(); iter++){
+      if ((*iter).find(SlotKeyPrefix) != std::string::npos){
+        continue;
+      }
+      if(std::find(cleanupSlots.begin(), cleanupSlots.end(), SlotNum(*iter)) != cleanupSlots.end()){
+        if(KeyType(*iter, key_type) > 0){
+          if(KeyDelete(*iter, key_type[0]) <= 0){
+            LOG(WARNING) << "BG slots_cleanup slot " << SlotNum(*iter) << " key "<< *iter << " error";
+          }
+        }
+      }
+    }
+
+    cleanup.cursor = cursor_ret;
+    p->SetSlotscleanupingCursor(cursor_ret);
+    keys.clear();
+  }
+  p->SetSlotscleanuping(false);
+  std::vector<int> empty;
+  p->SetCleanupSlots(empty);
+  LOG(INFO) << "Finish slots cleanup!";
+}
+
+int PikaServer::SlotsMigrateOne(const std::string &key){
+  return slotsmgrt_sender_thread_->SlotsMigrateOne(key);
+}
+
+bool PikaServer::SlotsMigrateBatch(const std::string &ip, int64_t port, int64_t time_out, int64_t slot, int64_t keys_num){
+  return slotsmgrt_sender_thread_->SlotsMigrateBatch(ip, port, time_out, slot, keys_num);
+}
+
+bool PikaServer::GetSlotsMigrateResul(int64_t *moved, int64_t *remained) {
+  return slotsmgrt_sender_thread_->GetSlotsMigrateResul(moved, remained);
+}
+
+void PikaServer::GetSlotsMgrtSenderStatus(std::string *ip, int64_t *port, int64_t *slot, bool *migrating, int64_t *moved, int64_t *remained) {
+  slotsmgrt_sender_thread_->GetSlotsMgrtSenderStatus(ip, port, slot, migrating, moved, remained);
+}
+
+bool PikaServer::SlotsMigrateAsyncCancel() {
+  return slotsmgrt_sender_thread_->SlotsMigrateAsyncCancel();
 }
 
 bool PikaServer::PurgeLogs(uint32_t to, bool manual, bool force) {
@@ -1039,7 +1233,8 @@ bool PikaServer::CouldPurge(uint32_t index) {
     }
     PikaBinlogSenderThread *pb = static_cast<PikaBinlogSenderThread*>((*it).sender);
     uint32_t filenum = pb->filenum();
-    if (index > filenum) {
+    if (index > filenum ||  // slaves
+        !pika_hub_manager_->CouldPurge(index)) {  // pika hub
       return false;
     }
   }
@@ -1061,7 +1256,8 @@ bool PikaServer::PurgeFiles(uint32_t to, bool manual, bool force)
   for (it = binlogs.begin(); it != binlogs.end(); ++it) {
     if ((manual && it->first <= to) ||           // Argument bound
         remain_expire_num > 0 ||                 // Expire num trigger
-        (stat(((g_pika_conf->log_path() + it->second)).c_str(), &file_stat) == 0 &&
+        (binlogs.size() > 10 /* at lease remain 10 files */
+         && stat(((g_pika_conf->log_path() + it->second)).c_str(), &file_stat) == 0 &&
          file_stat.st_mtime < time(NULL) - g_pika_conf->expire_logs_days()*24*3600)) // Expire time trigger
     {
       // We check this every time to avoid lock when we do file deletion
@@ -1211,7 +1407,6 @@ void PikaServer::AutoDeleteExpiredDump() {
   if (slash::GetChildren(db_sync_path, dump_dir) != 0) {
     return;
   }
-
   // Handle dump directory
   for (size_t i = 0; i < dump_dir.size(); i++) {
     if (dump_dir[i].substr(0, db_sync_prefix.size()) != db_sync_prefix || dump_dir[i].size() != (db_sync_prefix.size() + 8)) {
@@ -1285,6 +1480,10 @@ bool PikaServer::FlushAll() {
       return false;
     }
   }
+
+  LOG(INFO) << "Delete old db...";
+  db_.reset();
+
   std::string dbpath = g_pika_conf->db_path();
   if (dbpath[dbpath.length() - 1] == '/') {
     dbpath.erase(dbpath.length() - 1);
@@ -1294,23 +1493,49 @@ bool PikaServer::FlushAll() {
   dbpath.append("/deleting");
   slash::RenameFile(g_pika_conf->db_path(), dbpath.c_str());
 
-  LOG(INFO) << "Delete old db...";
-  db_.reset();
-
   nemo::Options option;
-  option.write_buffer_size = g_pika_conf->write_buffer_size();
-  option.target_file_size_base = g_pika_conf->target_file_size_base();
-  option.max_background_flushes = g_pika_conf->max_background_flushes();
-  option.max_background_compactions = g_pika_conf->max_background_compactions();
-  option.max_open_files = g_pika_conf->max_cache_files();
-  option.max_bytes_for_level_multiplier = g_pika_conf->max_bytes_for_level_multiplier();
-  if (g_pika_conf->compression() == "none") {
-    option.compression = false;
-  }
+  NemoOptionInit(&option);
+
   LOG(INFO) << "Prepare open new db...";
   db_ = std::shared_ptr<nemo::Nemo>(new nemo::Nemo(g_pika_conf->db_path(), option));
   LOG(INFO) << "open new db success";
   PurgeDir(dbpath);
+  return true;
+}
+
+bool PikaServer::FlushDb(const std::string& db_name) {
+  {
+    slash::MutexLock l(&bgsave_protector_);
+    if (bgsave_info_.bgsaving) {
+      return false;
+    }
+  }
+  {
+    slash::MutexLock l(&key_scan_protector_);
+    if (key_scan_info_.key_scaning_) {
+      return false;
+    }
+  }
+
+  std::string db_alias = db_name != "kv" ? db_name : "string";
+  LOG(INFO) << "Delete old " + db_alias + " db...";
+  db_.reset();
+
+  std::string dbpath = g_pika_conf->db_path();
+  if (dbpath[dbpath.length() - 1] != '/') {
+     dbpath.append("/");
+  }
+  std::string sub_dbpath = dbpath + db_name;
+  std::string del_dbpath = dbpath + db_alias + "_deleting";
+  slash::RenameFile(sub_dbpath, del_dbpath);
+
+  nemo::Options option;
+  NemoOptionInit(&option);
+
+  LOG(INFO) << "Prepare open new " + db_alias + " db...";
+  db_ = std::shared_ptr<nemo::Nemo>(new nemo::Nemo(g_pika_conf->db_path(), option));
+  LOG(INFO) << "open new " + db_alias + " db success";
+  PurgeDir(del_dbpath);
   return true;
 }
 
@@ -1329,6 +1554,41 @@ void PikaServer::DoPurgeDir(void* arg) {
   delete static_cast<std::string*>(arg);
 }
 
+// PubSub
+
+// Publish
+int PikaServer::Publish(const std::string& channel, const std::string& msg) {
+  int receivers = pika_pubsub_thread_->Publish(channel, msg);
+  return receivers;
+}
+
+// Subscribe/PSubscribe
+void PikaServer::Subscribe(pink::PinkConn* conn, const std::vector<std::string>& channels, bool pattern, std::vector<std::pair<std::string, int>>* result) {
+  pika_pubsub_thread_->Subscribe(conn, channels, pattern, result);
+}
+
+// UnSubscribe/PUnSubscribe
+int PikaServer::UnSubscribe(pink::PinkConn* conn, const std::vector<std::string>& channels, bool pattern, std::vector<std::pair<std::string, int>>* result) {
+  int subscribed = pika_pubsub_thread_->UnSubscribe(conn, channels, pattern, result);
+  return subscribed;
+}
+
+/*
+ * PubSub
+ */
+void PikaServer::PubSubChannels(const std::string& pattern,
+                      std::vector<std::string >* result) {
+  pika_pubsub_thread_->PubSubChannels(pattern, result);
+}
+
+void PikaServer::PubSubNumSub(const std::vector<std::string>& channels,
+                    std::vector<std::pair<std::string, int>>* result) {
+  pika_pubsub_thread_->PubSubNumSub(channels, result);
+}
+int PikaServer::PubSubNumPat() {
+  return pika_pubsub_thread_->PubSubNumPat();
+}
+
 void PikaServer::AddMonitorClient(PikaClientConn* client_ptr) {
   monitor_thread_->AddMonitorClient(client_ptr);
 }
@@ -1342,10 +1602,9 @@ bool PikaServer::HasMonitorClients() {
 }
 
 void PikaServer::DispatchBinlogBG(const std::string &key,
-    PikaCmdArgsType* argv, const std::string& raw_args,
-    uint64_t cur_serial, bool readonly) {
+    PikaCmdArgsType* argv, uint64_t cur_serial, bool readonly) {
   size_t index = str_hash(key) % binlogbg_workers_.size();
-  binlogbg_workers_[index]->Schedule(argv, raw_args, cur_serial, readonly);
+  binlogbg_workers_[index]->Schedule(argv, cur_serial, readonly);
 }
 
 bool PikaServer::WaitTillBinlogBGSerial(uint64_t my_serial) {

@@ -7,12 +7,12 @@
 #include <sys/resource.h>
 
 #include "slash/include/env.h"
-#include "pika_server.h"
-#include "pika_command.h"
-#include "pika_conf.h"
-#include "pika_define.h"
-#include "pika_slot.h"
-#include "pika_version.h"
+#include "include/pika_server.h"
+#include "include/pika_command.h"
+#include "include/pika_conf.h"
+#include "include/pika_define.h"
+#include "include/pika_slot.h"
+#include "include/pika_version.h"
 
 #ifdef TCMALLOC_EXTENSION
 #include <gperftools/malloc_extension.h>
@@ -190,6 +190,15 @@ int main(int argc, char *argv[]) {
   }
 
   g_pika_server->Start();
+  
+  if (g_pika_conf->daemonize()) {
+    unlink(g_pika_conf->pidfile().c_str());
+  }
 
+  delete g_pika_server;
+  DestoryCmdInfoTable();
+  ::google::ShutdownGoogleLogging();
+  delete g_pika_conf;
+  
   return 0;
 }

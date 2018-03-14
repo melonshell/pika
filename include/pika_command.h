@@ -14,11 +14,13 @@
 #include "slash/include/slash_string.h"
 #include "pink/include/redis_conn.h"
 
+const std::string kPikaBinlogMagic = "__PIKA_X#$SKGI";
 
 //Constant for command name
 //Admin
 const std::string kCmdNameSlaveof = "slaveof";
 const std::string kCmdNameTrysync = "trysync";
+const std::string kCmdNameInternalTrysync = "internaltrysync";
 const std::string kCmdNameAuth = "auth";
 const std::string kCmdNameBgsave = "bgsave";
 const std::string kCmdNameBgsaveoff = "bgsaveoff";
@@ -27,6 +29,7 @@ const std::string kCmdNamePurgelogsto = "purgelogsto";
 const std::string kCmdNamePing = "ping";
 const std::string kCmdNameSelect = "select";
 const std::string kCmdNameFlushall = "flushall";
+const std::string kCmdNameFlushdb = "flushdb";
 const std::string kCmdNameReadonly = "readonly";
 const std::string kCmdNameClient = "client";
 const std::string kCmdNameShutdown = "shutdown";
@@ -51,6 +54,13 @@ const std::string kCmdNameSlotsReload = "slotsreload";
 const std::string kCmdNameSlotsReloadOff = "slotsreloadoff";
 const std::string kCmdNameSlotsDel = "slotsdel";
 const std::string kCmdNameSlotsScan = "slotsscan";
+const std::string kCmdNameSlotsCleanup = "slotscleanup";
+const std::string kCmdNameSlotsCleanupOff = "slotscleanupoff";
+const std::string kCmdNameSlotsMgrtTagSlotAsync = "slotsmgrttagslot-async";
+const std::string kCmdNameSlotsMgrtSlotAsync = "slotsmgrtslot-async";
+const std::string kCmdNameSlotsMgrtExecWrapper = "slotsmgrt-exec-wrapper";
+const std::string kCmdNameSlotsMgrtAsyncStatus = "slotsmgrt-async-status";
+const std::string kCmdNameSlotsMgrtAsyncCancel = "slotsmgrt-async-cancel";
 
 //Kv
 const std::string kCmdNameSet = "set";
@@ -175,11 +185,20 @@ const std::string kCmdNameGeoHash = "geohash";
 const std::string kCmdNameGeoRadius = "georadius";
 const std::string kCmdNameGeoRadiusByMember = "georadiusbymember";
 
+//Pub/Sub
+const std::string kCmdNamePublish = "publish";
+const std::string kCmdNameSubscribe = "subscribe";
+const std::string kCmdNameUnSubscribe = "unsubscribe";
+const std::string kCmdNamePubSub = "pubsub";
+const std::string kCmdNamePSubscribe = "psubscribe";
+const std::string kCmdNamePUnSubscribe = "punsubscribe";
+
 typedef pink::RedisCmdArgsType PikaCmdArgsType;
+static const int RAW_ARGS_LEN = 1024 * 1024; 
 
 enum CmdFlagsMask {
   kCmdFlagsMaskRW               = 1,
-  kCmdFlagsMaskType             = 28,
+  kCmdFlagsMaskType             = 30,
   kCmdFlagsMaskLocal            = 32,
   kCmdFlagsMaskSuspend          = 64,
   kCmdFlagsMaskPrior            = 128,
@@ -198,6 +217,7 @@ enum CmdFlags {
   kCmdFlagsBit            = 12,
   kCmdFlagsHyperLogLog    = 14,
   kCmdFlagsGeo            = 16,
+  kCmdFlagsPubSub         = 18,
   kCmdFlagsNoLocal        = 0, //default nolocal
   kCmdFlagsLocal          = 32,
   kCmdFlagsNoSuspend      = 0, //default nosuspend
@@ -278,6 +298,7 @@ public:
     kInvalidParameter,
     kWrongNum,
     kInvalidIndex,
+    kInvalidDbType,
     kErrOther,
   };
 
@@ -342,6 +363,9 @@ public:
     case kInvalidIndex:
       result = "-ERR invalid DB index\r\n";
       break;
+    case kInvalidDbType:
+      result = "-ERR invalid DB type\r\n";
+      break;
     case kErrOther:
       result = "-ERR ";
       result.append(message_);
@@ -386,25 +410,68 @@ private:
 };
 
 class Cmd {
-public:
+ public:
   Cmd() {}
   virtual ~Cmd() {}
+
   virtual void Do() = 0;
+
   void Initial(PikaCmdArgsType &argvs, const CmdInfo* const ptr_info) {
     res_.clear(); // Clear res content
     Clear();      // Clear cmd, Derived class can has own implement
     DoInitial(argvs, ptr_info);
   };
+
   CmdRes& res() {
     return res_;
   }
 
-protected:
+  virtual std::string ToBinlog(
+      const PikaCmdArgsType& argv,
+      const std::string& server_id,
+      const std::string& binlog_info,
+      bool need_send_to_hub) {
+    std::string res;
+    res.reserve(RAW_ARGS_LEN);
+    RedisAppendLen(res, argv.size() + 4, "*");
+
+    for (auto& v : argv) {
+      RedisAppendLen(res, v.size(), "$");
+      RedisAppendContent(res, v);
+    }
+
+    AppendAffiliatedInfo(res, server_id, binlog_info, need_send_to_hub);
+
+    return res;
+  }
+
+ protected:
   CmdRes res_;
 
-private:
+  void AppendAffiliatedInfo(
+      std::string& res,
+      const std::string& server_id,
+      const std::string& binlog_info,
+      bool need_send_to_hub) {
+    // kPikaBinlogMagic
+    RedisAppendLen(res, kPikaBinlogMagic.size(), "$");
+    RedisAppendContent(res, kPikaBinlogMagic);
+    // server_id
+    RedisAppendLen(res, server_id.size(), "$");
+    RedisAppendContent(res, server_id);
+    // binlog_info
+    RedisAppendLen(res, binlog_info.size(), "$");
+    RedisAppendContent(res, binlog_info);
+    // need_send_to_hub
+    std::string v = need_send_to_hub ? "1" : "0";
+    RedisAppendLen(res, v.size(), "$");
+    RedisAppendContent(res, v);
+  }
+
+ private:
   virtual void DoInitial(PikaCmdArgsType &argvs, const CmdInfo* const ptr_info) = 0;
   virtual void Clear() {};
+
   Cmd(const Cmd&);
   Cmd& operator=(const Cmd&);
 };
@@ -421,15 +488,17 @@ void InitCmdTable(CmdTable* cmd_table);
 Cmd* GetCmdFromTable(const std::string& opt, const CmdTable& cmd_table);
 void DestoryCmdTable(CmdTable* cmd_table);
 
-void inline RedisAppendContent(std::string& str, const std::string& value) {
+void RedisAppendContent(std::string& str, const std::string& value) {
   str.append(value.data(), value.size());
   str.append(kNewLine);
 }
-void inline RedisAppendLen(std::string& str, int ori, const std::string &prefix) {
+
+void RedisAppendLen(std::string& str, int ori, const std::string &prefix) {
   char buf[32];
   slash::ll2string(buf, 32, static_cast<long long>(ori));
   str.append(prefix);
   str.append(buf);
   str.append(kNewLine);
 }
+
 #endif

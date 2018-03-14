@@ -3,16 +3,17 @@
 // LICENSE file in the root directory of this source tree. An additional grant
 // of patent rights can be found in the PATENTS file in the same directory.
 
-#include "pika_admin.h"
-#include "pika_slot.h"
-#include "pika_kv.h"
-#include "pika_hash.h"
-#include "pika_list.h"
-#include "pika_set.h"
-#include "pika_zset.h"
-#include "pika_bit.h"
-#include "pika_hyperloglog.h"
-#include "pika_geo.h"
+#include "include/pika_admin.h"
+#include "include/pika_slot.h"
+#include "include/pika_kv.h"
+#include "include/pika_hash.h"
+#include "include/pika_list.h"
+#include "include/pika_set.h"
+#include "include/pika_zset.h"
+#include "include/pika_bit.h"
+#include "include/pika_hyperloglog.h"
+#include "include/pika_geo.h"
+#include "include/pika_pubsub.h"
 
 static std::unordered_map<std::string, CmdInfo*> cmd_infos(300);    /* Table for CmdInfo */
 
@@ -25,13 +26,16 @@ void InitCmdInfoTable() {
   ////Trysync
   CmdInfo* trysyncptr = new CmdInfo(kCmdNameTrysync, 5, kCmdFlagsRead | kCmdFlagsAdmin | kCmdFlagsSuspend | kCmdFlagsAdminRequire);
   cmd_infos.insert(std::pair<std::string, CmdInfo*>(kCmdNameTrysync, trysyncptr));
+  ////InternalTrysync for Pika HUB
+  CmdInfo* internal_trysyncptr = new CmdInfo(kCmdNameInternalTrysync, 6, kCmdFlagsRead | kCmdFlagsAdmin | kCmdFlagsSuspend | kCmdFlagsAdminRequire);
+  cmd_infos.insert(std::pair<std::string, CmdInfo*>(kCmdNameInternalTrysync, internal_trysyncptr ));
   CmdInfo* authptr = new CmdInfo(kCmdNameAuth, 2, kCmdFlagsRead | kCmdFlagsAdmin);
   cmd_infos.insert(std::pair<std::string, CmdInfo*>(kCmdNameAuth, authptr));
   CmdInfo* bgsaveptr = new CmdInfo(kCmdNameBgsave, 1, kCmdFlagsRead | kCmdFlagsAdmin | kCmdFlagsSuspend);
   cmd_infos.insert(std::pair<std::string, CmdInfo*>(kCmdNameBgsave, bgsaveptr));
   CmdInfo* bgsaveoffptr = new CmdInfo(kCmdNameBgsaveoff, 1, kCmdFlagsRead | kCmdFlagsAdmin);
   cmd_infos.insert(std::pair<std::string, CmdInfo*>(kCmdNameBgsaveoff, bgsaveoffptr));
-  CmdInfo* compactptr = new CmdInfo(kCmdNameCompact, 1, kCmdFlagsRead | kCmdFlagsAdmin);
+  CmdInfo* compactptr = new CmdInfo(kCmdNameCompact, -1, kCmdFlagsRead | kCmdFlagsAdmin);
   cmd_infos.insert(std::pair<std::string, CmdInfo*>(kCmdNameCompact, compactptr));
   CmdInfo* purgelogptr = new CmdInfo(kCmdNamePurgelogsto, 2, kCmdFlagsRead | kCmdFlagsAdmin);
   cmd_infos.insert(std::pair<std::string, CmdInfo*>(kCmdNamePurgelogsto, purgelogptr));
@@ -41,6 +45,8 @@ void InitCmdInfoTable() {
   cmd_infos.insert(std::pair<std::string, CmdInfo*>(kCmdNameSelect, selectptr));
   CmdInfo* flushallptr = new CmdInfo(kCmdNameFlushall, 1, kCmdFlagsWrite | kCmdFlagsSuspend | kCmdFlagsAdmin);
   cmd_infos.insert(std::pair<std::string, CmdInfo*>(kCmdNameFlushall, flushallptr));
+  CmdInfo* flushdbptr = new CmdInfo(kCmdNameFlushdb, 2, kCmdFlagsWrite | kCmdFlagsSuspend | kCmdFlagsAdmin);
+  cmd_infos.insert(std::pair<std::string, CmdInfo*>(kCmdNameFlushdb, flushdbptr));
   CmdInfo* readonlyptr = new CmdInfo(kCmdNameReadonly, 2, kCmdFlagsRead | kCmdFlagsSuspend | kCmdFlagsAdmin);
   cmd_infos.insert(std::pair<std::string, CmdInfo*>(kCmdNameReadonly, readonlyptr));
   CmdInfo* clientptr = new CmdInfo(kCmdNameClient, -2, kCmdFlagsRead | kCmdFlagsAdmin);
@@ -86,6 +92,20 @@ void InitCmdInfoTable() {
   cmd_infos.insert(std::pair<std::string, CmdInfo*>(kCmdNameSlotsDel, slotsdelptr));
   CmdInfo* slotsscanptr = new CmdInfo(kCmdNameSlotsScan, -3, kCmdFlagsRead | kCmdFlagsAdmin);
   cmd_infos.insert(std::pair<std::string, CmdInfo*>(kCmdNameSlotsScan, slotsscanptr));
+  CmdInfo* slotscleanupptr = new CmdInfo(kCmdNameSlotsCleanup, -2, kCmdFlagsRead | kCmdFlagsAdmin);
+  cmd_infos.insert(std::pair<std::string, CmdInfo*>(kCmdNameSlotsCleanup, slotscleanupptr));
+  CmdInfo* slotscleanupoffptr = new CmdInfo(kCmdNameSlotsCleanupOff, -1, kCmdFlagsRead | kCmdFlagsAdmin);
+  cmd_infos.insert(std::pair<std::string, CmdInfo*>(kCmdNameSlotsCleanupOff, slotscleanupoffptr));
+  CmdInfo* slotmgrttagslotasyncptr = new CmdInfo(kCmdNameSlotsMgrtTagSlotAsync, 8, kCmdFlagsRead | kCmdFlagsAdmin);
+  cmd_infos.insert(std::pair<std::string, CmdInfo*>(kCmdNameSlotsMgrtTagSlotAsync, slotmgrttagslotasyncptr));
+  CmdInfo* slotmgrtslotasyncptr = new CmdInfo(kCmdNameSlotsMgrtSlotAsync, 8, kCmdFlagsRead | kCmdFlagsAdmin);
+  cmd_infos.insert(std::pair<std::string, CmdInfo*>(kCmdNameSlotsMgrtSlotAsync, slotmgrtslotasyncptr));
+  CmdInfo* slotmgrtexecwrapper = new CmdInfo(kCmdNameSlotsMgrtExecWrapper, -3, kCmdFlagsRead | kCmdFlagsAdmin);
+  cmd_infos.insert(std::pair<std::string, CmdInfo*>(kCmdNameSlotsMgrtExecWrapper, slotmgrtexecwrapper));
+  CmdInfo* slotmgrtasyncstatus = new CmdInfo(kCmdNameSlotsMgrtAsyncStatus, 1, kCmdFlagsRead | kCmdFlagsAdmin);
+  cmd_infos.insert(std::pair<std::string, CmdInfo*>(kCmdNameSlotsMgrtAsyncStatus, slotmgrtasyncstatus));
+  CmdInfo* slotmgrtasynccancel = new CmdInfo(kCmdNameSlotsMgrtAsyncCancel, 1, kCmdFlagsRead | kCmdFlagsAdmin);
+  cmd_infos.insert(std::pair<std::string, CmdInfo*>(kCmdNameSlotsMgrtAsyncCancel, slotmgrtasynccancel));
 
 
   //Kv
@@ -414,6 +434,26 @@ void InitCmdInfoTable() {
   ////GeoRadiusByMember
   CmdInfo* georadiusbymemberptr = new CmdInfo(kCmdNameGeoRadiusByMember, -5, kCmdFlagsRead | kCmdFlagsGeo);
   cmd_infos.insert(std::pair<std::string, CmdInfo*>(kCmdNameGeoRadiusByMember, georadiusbymemberptr));
+
+  //Pub/Sub
+  //Publish
+  CmdInfo* publishptr = new CmdInfo(kCmdNamePublish, 3, kCmdFlagsRead | kCmdFlagsPubSub);
+  cmd_infos.insert(std::pair<std::string, CmdInfo*>(kCmdNamePublish, publishptr));
+  //Subscribe
+  CmdInfo* subscribeptr = new CmdInfo(kCmdNameSubscribe, -2, kCmdFlagsRead | kCmdFlagsPubSub);
+  cmd_infos.insert(std::pair<std::string, CmdInfo*>(kCmdNameSubscribe, subscribeptr));
+  //UnSubscribe
+  CmdInfo* unsubscribeptr = new CmdInfo(kCmdNameUnSubscribe, -1, kCmdFlagsRead | kCmdFlagsPubSub);
+  cmd_infos.insert(std::pair<std::string, CmdInfo*>(kCmdNameUnSubscribe, unsubscribeptr));
+  //PSubscribe
+  CmdInfo* psubscribeptr = new CmdInfo(kCmdNamePSubscribe, -2, kCmdFlagsRead | kCmdFlagsPubSub);
+  cmd_infos.insert(std::pair<std::string, CmdInfo*>(kCmdNamePSubscribe, psubscribeptr));
+  //PUnSubscribe
+  CmdInfo* punsubscribeptr = new CmdInfo(kCmdNamePUnSubscribe, -1, kCmdFlagsRead | kCmdFlagsPubSub);
+  cmd_infos.insert(std::pair<std::string, CmdInfo*>(kCmdNamePUnSubscribe, punsubscribeptr));
+  //PubSub
+  CmdInfo* pubsubptr = new CmdInfo(kCmdNamePubSub, -2, kCmdFlagsRead | kCmdFlagsPubSub);
+  cmd_infos.insert(std::pair<std::string, CmdInfo*>(kCmdNamePubSub, pubsubptr));
 }
 
 void DestoryCmdInfoTable() {
@@ -439,6 +479,9 @@ void InitCmdTable(std::unordered_map<std::string, Cmd*> *cmd_table) {
   ////Trysync
   Cmd* trysyncptr = new TrysyncCmd();
   cmd_table->insert(std::pair<std::string, Cmd*>(kCmdNameTrysync, trysyncptr));
+  ////InternalTrysync
+  Cmd* internal_trysyncptr = new InternalTrysyncCmd();
+  cmd_table->insert(std::pair<std::string, Cmd*>(kCmdNameInternalTrysync, internal_trysyncptr));
   Cmd* authptr = new AuthCmd();
   cmd_table->insert(std::pair<std::string, Cmd*>(kCmdNameAuth, authptr));
   Cmd* bgsaveptr = new BgsaveCmd();
@@ -455,6 +498,8 @@ void InitCmdTable(std::unordered_map<std::string, Cmd*> *cmd_table) {
   cmd_table->insert(std::pair<std::string, Cmd*>(kCmdNameSelect, selectptr));
   Cmd* flushallptr = new FlushallCmd();
   cmd_table->insert(std::pair<std::string, Cmd*>(kCmdNameFlushall, flushallptr));
+  Cmd* flushdbptr = new FlushdbCmd();
+  cmd_table->insert(std::pair<std::string, Cmd*>(kCmdNameFlushdb, flushdbptr));
   Cmd* readonlyptr = new ReadonlyCmd();
   cmd_table->insert(std::pair<std::string, Cmd*>(kCmdNameReadonly, readonlyptr));
   Cmd* clientptr = new ClientCmd();
@@ -499,6 +544,20 @@ void InitCmdTable(std::unordered_map<std::string, Cmd*> *cmd_table) {
   cmd_table->insert(std::pair<std::string, Cmd*>(kCmdNameSlotsDel, slotsdelptr));
   Cmd* slotsscanptr = new SlotsScanCmd();
   cmd_table->insert(std::pair<std::string, Cmd*>(kCmdNameSlotsScan, slotsscanptr));
+  Cmd* slotscleanupptr = new SlotsCleanupCmd();
+  cmd_table->insert(std::pair<std::string, Cmd*>(kCmdNameSlotsCleanup, slotscleanupptr));
+  Cmd* slotscleanupoffptr = new SlotsCleanupOffCmd();
+  cmd_table->insert(std::pair<std::string, Cmd*>(kCmdNameSlotsCleanupOff, slotscleanupoffptr));
+  Cmd* slotmgrttagslotasyncptr = new SlotsMgrtTagSlotAsyncCmd();
+  cmd_table->insert(std::pair<std::string, Cmd*>(kCmdNameSlotsMgrtTagSlotAsync, slotmgrttagslotasyncptr));
+  Cmd* slotmgrtslotasyncptr = new SlotsMgrtTagSlotAsyncCmd();
+  cmd_table->insert(std::pair<std::string, Cmd*>(kCmdNameSlotsMgrtSlotAsync, slotmgrtslotasyncptr));
+  Cmd* slotmgrtexecwrapperptr = new SlotsMgrtExecWrapperCmd();
+  cmd_table->insert(std::pair<std::string, Cmd*>(kCmdNameSlotsMgrtExecWrapper, slotmgrtexecwrapperptr));
+  Cmd* slotmgrtasyncstatusptr = new SlotsMgrtAsyncStatusCmd();
+  cmd_table->insert(std::pair<std::string, Cmd*>(kCmdNameSlotsMgrtAsyncStatus, slotmgrtasyncstatusptr));
+  Cmd* slotmgrtasynccancelptr = new SlotsMgrtAsyncCancelCmd();
+  cmd_table->insert(std::pair<std::string, Cmd*>(kCmdNameSlotsMgrtAsyncCancel, slotmgrtasynccancelptr));
 
   //Kv
   ////SetCmd
@@ -823,6 +882,26 @@ void InitCmdTable(std::unordered_map<std::string, Cmd*> *cmd_table) {
   ////GeoRadiusByMember
   Cmd * georadiusbymemberptr = new GeoRadiusByMemberCmd();
   cmd_table->insert(std::pair<std::string, Cmd*>(kCmdNameGeoRadiusByMember, georadiusbymemberptr));
+
+  //PubSub
+  ////Publish
+  Cmd * publishptr = new PublishCmd();
+  cmd_table->insert(std::pair<std::string, Cmd*>(kCmdNamePublish, publishptr));
+  ////Subscribe
+  Cmd * subscribeptr = new SubscribeCmd();
+  cmd_table->insert(std::pair<std::string, Cmd*>(kCmdNameSubscribe, subscribeptr));
+  ////UnSubscribe
+  Cmd * unsubscribeptr = new UnSubscribeCmd();
+  cmd_table->insert(std::pair<std::string, Cmd*>(kCmdNameUnSubscribe, unsubscribeptr));
+  ////PSubscribe
+  Cmd * psubscribeptr = new PSubscribeCmd();
+  cmd_table->insert(std::pair<std::string, Cmd*>(kCmdNamePSubscribe, psubscribeptr));
+  ////PUnSubscribe
+  Cmd * punsubscribeptr = new PUnSubscribeCmd();
+  cmd_table->insert(std::pair<std::string, Cmd*>(kCmdNamePUnSubscribe, punsubscribeptr));
+  ////PubSub
+  Cmd * pubsubptr = new PubSubCmd();
+  cmd_table->insert(std::pair<std::string, Cmd*>(kCmdNamePubSub, pubsubptr));
 }
 
 Cmd* GetCmdFromTable(const std::string& opt, const CmdTable& cmd_table) {
