@@ -6,6 +6,7 @@
 #ifndef PIKA_DEFINE_H_
 #define PIKA_DEFINE_H_
 
+#include "include/pika_command.h"
 
 #define PIKA_MAX_WORKER_THREAD_NUM 24
 
@@ -32,24 +33,36 @@ struct SlaveItem {
   struct timeval create_time;
 };
 
+//slowlog define
+#define SLOWLOG_ENTRY_MAX_ARGC 32
+#define SLOWLOG_ENTRY_MAX_STRING 128
+
+//slowlog entry
+struct SlowlogEntry {
+  int64_t id;
+  int64_t start_time;
+  int64_t duration;
+  PikaCmdArgsType argv;
+};
+
 #define PIKA_MIN_RESERVED_FDS 5000
 
-#define SLAVE_ITEM_STAGE_ONE 1
-#define SLAVE_ITEM_STAGE_TWO 2
+const int SLAVE_ITEM_STAGE_ONE    = 1;
+const int SLAVE_ITEM_STAGE_TWO    = 2;
 
 //repl_state_
-#define PIKA_REPL_NO_CONNECT 0
-#define PIKA_REPL_CONNECT 1
-#define PIKA_REPL_CONNECTING 2
-#define PIKA_REPL_CONNECTED 3
-#define PIKA_REPL_WAIT_DBSYNC 4
-#define PIKA_REPL_ERROR 5
+const int PIKA_REPL_NO_CONNECT    = 0;
+const int PIKA_REPL_CONNECT       = 1;
+const int PIKA_REPL_CONNECTING    = 2;
+const int PIKA_REPL_CONNECTED     = 3;
+const int PIKA_REPL_WAIT_DBSYNC   = 4;
+const int PIKA_REPL_ERROR         = 5;
 
 //role
-#define PIKA_ROLE_SINGLE 0
-#define PIKA_ROLE_SLAVE 1
-#define PIKA_ROLE_MASTER 2
-#define PIKA_ROLE_DOUBLE_MASTER 3
+const int PIKA_ROLE_SINGLE        = 0;
+const int PIKA_ROLE_SLAVE         = 1;
+const int PIKA_ROLE_MASTER        = 2;
+const int PIKA_ROLE_DOUBLE_MASTER = 3;
 
 /*
  * The size of Binlogfile

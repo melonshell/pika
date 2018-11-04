@@ -4,10 +4,8 @@
 // of patent rights can be found in the PATENTS file in the same directory.
 
 #include "slash/include/slash_string.h"
-#include "nemo.h"
 #include "include/pika_zset.h"
 #include "include/pika_server.h"
-#include "include/pika_slot.h"
 
 extern PikaServer *g_pika_server;
 
@@ -22,7 +20,7 @@ void ZAddCmd::DoInitial(PikaCmdArgsType &argv, const CmdInfo* const ptr_info) {
     return;
   }
   key_ = argv[1];
-  sms_v_.clear();
+  score_members.clear();
   double score;
   size_t index = 2;
   for (; index < argc; index += 2) {
@@ -30,27 +28,19 @@ void ZAddCmd::DoInitial(PikaCmdArgsType &argv, const CmdInfo* const ptr_info) {
       res_.SetRes(CmdRes::kInvalidFloat);
       return;
     }
-    sms_v_.push_back({score, argv[index+1]});
+    score_members.push_back({score, argv[index + 1]});
   }
   return;
 }
 
 void ZAddCmd::Do() {
-  nemo::Status s;
-  int64_t count = 0, ret;
-  const std::shared_ptr<nemo::Nemo> db = g_pika_server->db();
-  std::vector<nemo::SM>::const_iterator iter = sms_v_.begin();
-  for (; iter != sms_v_.end(); iter++) {
-    s = db->ZAdd(key_, iter->score, iter->member, &ret);
-    if (s.ok()) {
-      count += ret;
-    } else {
-      res_.SetRes(CmdRes::kErrOther, s.ToString());
-      return;
-    }
+  int32_t count = 0;
+  rocksdb::Status s = g_pika_server->db()->ZAdd(key_, score_members, &count);
+  if (s.ok()) {
+    res_.AppendInteger(count);
+  } else {
+    res_.SetRes(CmdRes::kErrOther, s.ToString());
   }
-  SlotKeyAdd("z", key_);
-  res_.AppendInteger(count);
   return;
 }
 
@@ -64,8 +54,9 @@ void ZCardCmd::DoInitial(PikaCmdArgsType &argv, const CmdInfo* const ptr_info) {
 }
 
 void ZCardCmd::Do() {
-  int64_t card = g_pika_server->db()->ZCard(key_);
-  if (card >= 0) {
+  int32_t card = 0;
+  rocksdb::Status s = g_pika_server->db()->ZCard(key_, &card);
+  if (s.ok() || s.IsNotFound()) {
     res_.AppendInteger(card);
   } else {
     res_.SetRes(CmdRes::kErrOther, "zcard error");
@@ -112,49 +103,27 @@ void ZScanCmd::DoInitial(PikaCmdArgsType &argv, const CmdInfo* const ptr_info) {
 }
 
 void ZScanCmd::Do() {
-  int64_t card = g_pika_server->db()->ZCard(key_);
-  if (card >= 0 && cursor_ >= card) {
-    cursor_ = 0;
-  }
-  if (card <= 128) {
-    count_ = 128;
-  }
-  std::vector<nemo::SM> sms_v;
-  nemo::ZIterator *iter = g_pika_server->db()->ZScan(key_, nemo::ZSET_SCORE_MIN, nemo::ZSET_SCORE_MAX, -1);
-  iter->Skip(cursor_);
-  if (!iter->Valid()) {
-    delete iter;
-    iter = g_pika_server->db()->ZScan(key_, nemo::ZSET_SCORE_MIN, nemo::ZSET_SCORE_MAX, -1);
-    cursor_ = 0;
-  }
-  for (; iter->Valid() && count_; iter->Next()) {
-    count_--;
-    cursor_++;
-    if (pattern_ != "*" && !slash::stringmatchlen(pattern_.data(), pattern_.size(), iter->member().data(), iter->member().size(), 0)) {
-      continue;
-    }
-    sms_v.push_back({iter->score(), iter->member()});
-  }
-  if (!iter->Valid()) {
-    cursor_ = 0;
-  }
-  res_.AppendContent("*2");
-  
-  char buf[32];
-  int64_t len = slash::ll2string(buf, sizeof(buf), cursor_);
-  res_.AppendStringLen(len);
-  res_.AppendContent(buf);
-
-  res_.AppendArrayLen(sms_v.size() * 2); 
-  std::vector<nemo::SM>::const_iterator iter_sm = sms_v.begin();
-  for (; iter_sm != sms_v.end(); iter_sm++) {
-    res_.AppendStringLen(iter_sm->member.size());
-    res_.AppendContent(iter_sm->member);
-    len = slash::d2string(buf, sizeof(buf), iter_sm->score);
+  int64_t next_cursor = 0;
+  std::vector<blackwidow::ScoreMember> score_members;
+  rocksdb::Status s = g_pika_server->db()->ZScan(key_, cursor_, pattern_, count_, &score_members, &next_cursor);
+  if (s.ok() || s.IsNotFound()) {
+    res_.AppendContent("*2");
+    char buf[32];
+    int64_t len = slash::ll2string(buf, sizeof(buf), next_cursor);
     res_.AppendStringLen(len);
     res_.AppendContent(buf);
+
+    res_.AppendArrayLen(score_members.size() * 2);
+    for (const auto& score_member : score_members) {
+      res_.AppendString(score_member.member);
+
+      len = slash::d2string(buf, sizeof(buf), score_member.score);
+      res_.AppendStringLen(len);
+      res_.AppendContent(buf);
+    }
+  } else {
+    res_.SetRes(CmdRes::kErrOther, s.ToString());
   }
-  delete iter;
   return;
 }
 
@@ -173,12 +142,13 @@ void ZIncrbyCmd::DoInitial(PikaCmdArgsType &argv, const CmdInfo* const ptr_info)
 }
 
 void ZIncrbyCmd::Do() {
-  std::string new_value;
-  nemo::Status s = g_pika_server->db()->ZIncrby(key_, member_, by_, new_value);
+  double score = 0;
+  rocksdb::Status s = g_pika_server->db()->ZIncrby(key_, member_, by_, &score);
   if (s.ok()) {
-    res_.AppendStringLen(new_value.size());
-    res_.AppendContent(new_value);
-    SlotKeyAdd("z", key_);
+    char buf[32];
+    int64_t len = slash::d2string(buf, sizeof(buf), score);
+    res_.AppendStringLen(len);
+    res_.AppendContent(buf);
   } else {
     res_.SetRes(CmdRes::kErrOther, s.ToString());
   }
@@ -214,26 +184,25 @@ void ZRangeCmd::DoInitial(PikaCmdArgsType &argv, const CmdInfo* const ptr_info) 
 }
 
 void ZRangeCmd::Do() {
-  std::vector<nemo::SM> sms_v;
-  nemo::Status s = g_pika_server->db()->ZRange(key_, start_, stop_, sms_v);
-  if (s.ok()) {
-    std::vector<nemo::SM>::const_iterator iter = sms_v.begin();
+  std::vector<blackwidow::ScoreMember> score_members;
+  rocksdb::Status s = g_pika_server->db()->ZRange(key_, start_, stop_, &score_members);
+  if (s.ok() || s.IsNotFound()) {
     if (is_ws_) {
-      res_.AppendArrayLen(sms_v.size()*2);
       char buf[32];
       int64_t len;
-      for (; iter != sms_v.end(); iter++) {
-        res_.AppendStringLen(iter->member.size());
-        res_.AppendContent(iter->member);
-        len = slash::d2string(buf, sizeof(buf), iter->score);
+      res_.AppendArrayLen(score_members.size() * 2);
+      for (const auto& sm : score_members) {
+        res_.AppendStringLen(sm.member.size());
+        res_.AppendContent(sm.member);
+        len = slash::d2string(buf, sizeof(buf), sm.score);
         res_.AppendStringLen(len);
         res_.AppendContent(buf);
       }
     } else {
-      res_.AppendArrayLen(sms_v.size());
-      for (; iter != sms_v.end(); iter++) {
-        res_.AppendStringLen(iter->member.size());
-        res_.AppendContent(iter->member);
+      res_.AppendArrayLen(score_members.size());
+      for (const auto& sm : score_members) {
+        res_.AppendStringLen(sm.member.size());
+        res_.AppendContent(sm.member);
       }
     }
   } else {
@@ -242,13 +211,13 @@ void ZRangeCmd::Do() {
   return;
 }
 
-static void Calcmirror(int64_t &start, int64_t &stop, int64_t t_size) {
-    int64_t t_start = stop >= 0 ? stop : t_size + stop;
-    int64_t t_stop = start >= 0 ? start : t_size + start;
-    t_start = t_size - 1 - t_start;
-    t_stop = t_size - 1 - t_stop;
-    start = t_start >= 0 ? t_start : t_start - t_size;
-    stop = t_stop >= 0 ? t_stop : t_stop - t_size;
+static void Calcmirror(int64_t &start, int64_t &stop, int32_t t_size) {
+  int64_t t_start = stop >= 0 ? stop : t_size + stop;
+  int64_t t_stop = start >= 0 ? start : t_size + start;
+  t_start = t_size - 1 - t_start;
+  t_stop = t_size - 1 - t_stop;
+  start = t_start >= 0 ? t_start : t_start - t_size;
+  stop = t_stop >= 0 ? t_stop : t_stop - t_size;
 }
 
 void ZRevrangeCmd::DoInitial(PikaCmdArgsType &argv, const CmdInfo* const ptr_info) {
@@ -257,8 +226,9 @@ void ZRevrangeCmd::DoInitial(PikaCmdArgsType &argv, const CmdInfo* const ptr_inf
     return;
   }
   ZsetRangeParentCmd::DoInitial(argv, NULL);
-  int64_t card = g_pika_server->db()->ZCard(key_);
-  if (card < 0) {
+  int32_t card = 0;
+  rocksdb::Status status = g_pika_server->db()->ZCard(key_, &card);
+  if (!status.ok() && !status.IsNotFound()) {
     res_.SetRes(CmdRes::kErrOther, "zcard error");
     return;
   }
@@ -266,26 +236,25 @@ void ZRevrangeCmd::DoInitial(PikaCmdArgsType &argv, const CmdInfo* const ptr_inf
 }
 
 void ZRevrangeCmd::Do() {
-  std::vector<nemo::SM> sms_v;
-  nemo::Status s = g_pika_server->db()->ZRange(key_, start_, stop_, sms_v);
-  if (s.ok()) {
-    std::vector<nemo::SM>::const_reverse_iterator iter = sms_v.rbegin();
+  std::vector<blackwidow::ScoreMember> score_members;
+  rocksdb::Status s = g_pika_server->db()->ZRevrange(key_, start_, stop_, &score_members);
+  if (s.ok() || s.IsNotFound()) {
     if (is_ws_) {
-      res_.AppendArrayLen(sms_v.size()*2);
       char buf[32];
       int64_t len;
-      for (; iter != sms_v.rend(); iter++) {
-        res_.AppendStringLen(iter->member.size());
-        res_.AppendContent(iter->member);
-        len = slash::d2string(buf, sizeof(buf), iter->score);
+      res_.AppendArrayLen(score_members.size() * 2);
+      for (const auto& sm : score_members) {
+        res_.AppendStringLen(sm.member.size());
+        res_.AppendContent(sm.member);
+        len = slash::d2string(buf, sizeof(buf), sm.score);
         res_.AppendStringLen(len);
         res_.AppendContent(buf);
       }
     } else {
-      res_.AppendArrayLen(sms_v.size());
-      for (; iter != sms_v.rend(); iter++) {
-        res_.AppendStringLen(iter->member.size());
-        res_.AppendContent(iter->member);
+      res_.AppendArrayLen(score_members.size());
+      for (const auto& sm : score_members) {
+        res_.AppendStringLen(sm.member.size());
+        res_.AppendContent(sm.member);
       }
     }
   } else {
@@ -294,31 +263,31 @@ void ZRevrangeCmd::Do() {
   return;
 }
 
-static nemo::Status DoScoreStrRange(std::string begin_score, std::string end_score, bool *is_lo, bool *is_ro, double *min_score, double *max_score) {
+int32_t DoScoreStrRange(std::string begin_score, std::string end_score, bool *left_close, bool *right_close, double *min_score, double *max_score) {
   if (begin_score.size() > 0 && begin_score.at(0) == '(') {
-    *is_lo = true;
+    *left_close = false;
     begin_score.erase(begin_score.begin());
   }
   if (begin_score == "-inf") {
-    *min_score = nemo::ZSET_SCORE_MIN;
+    *min_score = blackwidow::ZSET_SCORE_MIN;
   } else if (begin_score == "inf" || begin_score == "+inf") {
-    *min_score = nemo::ZSET_SCORE_MAX;
+    *min_score = blackwidow::ZSET_SCORE_MAX;
   } else if (!slash::string2d(begin_score.data(), begin_score.size(), min_score)) {
-    return nemo::Status::Corruption("min or max is not a float");
+    return -1;
   } 
   
   if (end_score.size() > 0 && end_score.at(0) == '(') {
-    *is_ro = true;
+    *right_close = false;
     end_score.erase(end_score.begin());
   }
   if (end_score == "+inf" || end_score == "inf") {
-    *max_score = nemo::ZSET_SCORE_MAX; 
+    *max_score = blackwidow::ZSET_SCORE_MAX;
   } else if (end_score == "-inf") {
-    *max_score = nemo::ZSET_SCORE_MIN;
+    *max_score = blackwidow::ZSET_SCORE_MIN;
   } else if (!slash::string2d(end_score.data(), end_score.size(), max_score)) {
-    return nemo::Status::Corruption("min or max is not a float");
+    return -1;
   }
-  return nemo::Status();
+  return 0;
 }
 
 static void FitLimit(int64_t &count, int64_t &offset, const int64_t size) {
@@ -330,8 +299,8 @@ static void FitLimit(int64_t &count, int64_t &offset, const int64_t size) {
 void ZsetRangebyscoreParentCmd::DoInitial(PikaCmdArgsType &argv, const CmdInfo* const ptr_info) {
   (void)ptr_info;
   key_ = argv[1];
-  nemo::Status s = DoScoreStrRange(argv[2], argv[3], &is_lo_, &is_ro_, &min_score_, &max_score_);
-  if (!s.ok()) {
+  int32_t ret = DoScoreStrRange(argv[2], argv[3], &left_close_, &right_close_, &min_score_, &max_score_);
+  if (ret == -1) {
     res_.SetRes(CmdRes::kErrOther, "min or max is not a float");
     return;
   }
@@ -343,7 +312,7 @@ void ZsetRangebyscoreParentCmd::DoInitial(PikaCmdArgsType &argv, const CmdInfo* 
   while (index < argc) {
     slash::StringToLower(argv[index]);
     if (argv[index] == "withscores") {
-      is_ws_ = true;
+      with_scores_ = true;
     } else if (argv[index] == "limit") {
       if (index + 3 > argc) {
         res_.SetRes(CmdRes::kSyntaxErr);
@@ -376,34 +345,34 @@ void ZRangebyscoreCmd::DoInitial(PikaCmdArgsType &argv, const CmdInfo* const ptr
 }
 
 void ZRangebyscoreCmd::Do() {
-  if (min_score_ == nemo::ZSET_SCORE_MAX || max_score_ == nemo::ZSET_SCORE_MIN) {
+  if (min_score_ == blackwidow::ZSET_SCORE_MAX || max_score_ == blackwidow::ZSET_SCORE_MIN) {
     res_.AppendContent("*0");
     return;
   }
-  std::vector<nemo::SM> sms_v;
-  nemo::Status s = g_pika_server->db()->ZRangebyscore(key_, min_score_, max_score_, sms_v, is_lo_, is_ro_);
-  if (!s.ok()) {
+  std::vector<blackwidow::ScoreMember> score_members;
+  rocksdb::Status s = g_pika_server->db()->ZRangebyscore(key_, min_score_, max_score_, left_close_, right_close_, &score_members);
+  if (!s.ok() && !s.IsNotFound()) {
     res_.SetRes(CmdRes::kErrOther, s.ToString());
     return;
   }
-  FitLimit(count_, offset_, sms_v.size());
+  FitLimit(count_, offset_, score_members.size());
   size_t index = offset_, end = offset_ + count_;
-  if (is_ws_) {
-    res_.AppendArrayLen(count_ * 2);
+  if (with_scores_) {
     char buf[32];
     int64_t len;
+    res_.AppendArrayLen(count_ * 2);
     for (; index < end; index++) {
-      res_.AppendStringLen(sms_v[index].member.size());
-      res_.AppendContent(sms_v[index].member);
-      len = slash::d2string(buf, sizeof(buf), sms_v[index].score);
+      res_.AppendStringLen(score_members[index].member.size());
+      res_.AppendContent(score_members[index].member);
+      len = slash::d2string(buf, sizeof(buf), score_members[index].score);
       res_.AppendStringLen(len);
       res_.AppendContent(buf);
     }
   } else {
     res_.AppendArrayLen(count_);
     for (; index < end; index++) {
-      res_.AppendStringLen(sms_v[index].member.size());
-      res_.AppendContent(sms_v[index].member);
+      res_.AppendStringLen(score_members[index].member.size());
+      res_.AppendContent(score_members[index].member);
     }
   }
   return;
@@ -415,46 +384,46 @@ void ZRevrangebyscoreCmd::DoInitial(PikaCmdArgsType &argv, const CmdInfo* const 
     return;
   }
   ZsetRangebyscoreParentCmd::DoInitial(argv, NULL);
-  double tmp_d;
-  tmp_d = min_score_;
+  double tmp_score;
+  tmp_score = min_score_;
   min_score_ = max_score_;
-  max_score_ = tmp_d;
+  max_score_ = tmp_score;
 
-  bool tmp_b;
-  tmp_b = is_lo_;
-  is_lo_ = is_ro_;
-  is_ro_ = tmp_b;
+  bool tmp_close;
+  tmp_close = left_close_;
+  left_close_ = right_close_;
+  right_close_ = tmp_close;
 }
 
 void ZRevrangebyscoreCmd::Do() {
-  if (min_score_ == nemo::ZSET_SCORE_MAX || max_score_ == nemo::ZSET_SCORE_MIN) {
+  if (min_score_ == blackwidow::ZSET_SCORE_MAX || max_score_ == blackwidow::ZSET_SCORE_MIN) {
     res_.AppendContent("*0");
     return;
   }
-  std::vector<nemo::SM> sms_v;
-  nemo::Status s = g_pika_server->db()->ZRangebyscore(key_, min_score_, max_score_, sms_v, is_lo_, is_ro_);
-  if (!s.ok()) {
+  std::vector<blackwidow::ScoreMember> score_members;
+  rocksdb::Status s = g_pika_server->db()->ZRevrangebyscore(key_, min_score_, max_score_, left_close_, right_close_, &score_members);
+  if (!s.ok() && !s.IsNotFound()) {
     res_.SetRes(CmdRes::kErrOther, s.ToString());
     return;
   }
-  FitLimit(count_, offset_, sms_v.size());
-  int64_t index = sms_v.size() - 1 - offset_, end = index - count_;
-  if (is_ws_) {
-    res_.AppendArrayLen(count_ * 2);
+  FitLimit(count_, offset_, score_members.size());
+  int64_t index = offset_, end = offset_ + count_;
+  if (with_scores_) {
     char buf[32];
     int64_t len;
-    for (; index > end; index--) {
-      res_.AppendStringLen(sms_v[index].member.size());
-      res_.AppendContent(sms_v[index].member);
-      len = slash::d2string(buf, sizeof(buf), sms_v[index].score);
+    res_.AppendArrayLen(count_ * 2);
+    for (; index < end; index++) {
+      res_.AppendStringLen(score_members[index].member.size());
+      res_.AppendContent(score_members[index].member);
+      len = slash::d2string(buf, sizeof(buf), score_members[index].score);
       res_.AppendStringLen(len);
       res_.AppendContent(buf);
     }
   } else {
     res_.AppendArrayLen(count_);
-    for (; index > end; index--) {
-      res_.AppendStringLen(sms_v[index].member.size());
-      res_.AppendContent(sms_v[index].member);
+    for (; index < end; index++) {
+      res_.AppendStringLen(score_members[index].member.size());
+      res_.AppendContent(score_members[index].member);
     }
   }
   return;
@@ -466,8 +435,8 @@ void ZCountCmd::DoInitial(PikaCmdArgsType &argv, const CmdInfo* const ptr_info) 
     return;
   }
   key_ = argv[1];
-  nemo::Status s = DoScoreStrRange(argv[2], argv[3], &is_lo_, &is_ro_, &min_score_, &max_score_);
-  if (!s.ok()) {
+  int32_t ret = DoScoreStrRange(argv[2], argv[3], &left_close_, &right_close_, &min_score_, &max_score_);
+  if (ret == -1) {
     res_.SetRes(CmdRes::kErrOther, "min or max is not a float");
     return;
   }
@@ -475,12 +444,19 @@ void ZCountCmd::DoInitial(PikaCmdArgsType &argv, const CmdInfo* const ptr_info) 
 }
 
 void ZCountCmd::Do() {
-  if (min_score_ == nemo::ZSET_SCORE_MAX || max_score_ == nemo::ZSET_SCORE_MIN) {
+  if (min_score_ == blackwidow::ZSET_SCORE_MAX || max_score_ == blackwidow::ZSET_SCORE_MIN) {
     res_.AppendContent("*0");
     return;
   }
-  int64_t count = g_pika_server->db()->ZCount(key_, min_score_, max_score_, is_lo_, is_ro_);
-  res_.AppendInteger(count);
+
+  int32_t count = 0;
+  rocksdb::Status s = g_pika_server->db()->ZCount(key_, min_score_, max_score_, left_close_, right_close_, &count);
+  if (s.ok() || s.IsNotFound()) {
+    res_.AppendInteger(count);
+  } else {
+    res_.SetRes(CmdRes::kErrOther, s.ToString());
+  }
+  return;
 }
 
 void ZRemCmd::DoInitial(PikaCmdArgsType &argv, const CmdInfo* const ptr_info) {
@@ -495,19 +471,13 @@ void ZRemCmd::DoInitial(PikaCmdArgsType &argv, const CmdInfo* const ptr_info) {
 }
 
 void ZRemCmd::Do() {
-  int64_t count = 0, tmp;
-  std::vector<std::string>::const_iterator iter = members_.begin();
-  nemo::Status s;
-  std::shared_ptr<nemo::Nemo> db = g_pika_server->db();
-  for (; iter != members_.end(); iter++) {
-    s = db->ZRem(key_, *iter, &tmp);
-    if (s.ok()) {
-      count++;
-    }
+  int32_t count = 0;
+  rocksdb::Status s = g_pika_server->db()->ZRem(key_, members_, &count);
+  if (s.ok() || s.IsNotFound()) {
+    res_.AppendInteger(count);
+  } else {
+    res_.SetRes(CmdRes::kErrOther, s.ToString());
   }
-  res_.AppendInteger(count);
-
-  KeyNotExistsRem("z", key_);
   return;
 }
 
@@ -555,11 +525,11 @@ void ZsetUIstoreParentCmd::DoInitial(PikaCmdArgsType &argv, const CmdInfo* const
       }
       slash::StringToLower(argv[index]);
       if (argv[index] == "sum") {
-        aggregate_ = nemo::SUM;
+        aggregate_ = blackwidow::SUM;
       } else if (argv[index] == "min") {
-        aggregate_ = nemo::MIN;
+        aggregate_ = blackwidow::MIN;
       } else if (argv[index] == "max") {
-        aggregate_ = nemo::MAX;
+        aggregate_ = blackwidow::MAX;
       } else {
         res_.SetRes(CmdRes::kSyntaxErr);
         return;
@@ -582,8 +552,8 @@ void ZUnionstoreCmd::DoInitial(PikaCmdArgsType &argv, const CmdInfo* const ptr_i
 }
 
 void ZUnionstoreCmd::Do() {
-  int64_t count = 0;
-  nemo::Status s = g_pika_server->db()->ZUnionStore(dest_key_, num_keys_, keys_, weights_, aggregate_, &count);
+  int32_t count = 0;
+  rocksdb::Status s = g_pika_server->db()->ZUnionstore(dest_key_, keys_, weights_, aggregate_, &count);
   if (s.ok()) {
     res_.AppendInteger(count);
   } else {
@@ -602,8 +572,8 @@ void ZInterstoreCmd::DoInitial(PikaCmdArgsType &argv, const CmdInfo* const ptr_i
 }
 
 void ZInterstoreCmd::Do() {
-  int64_t count = 0;
-  nemo::Status s = g_pika_server->db()->ZInterStore(dest_key_, num_keys_, keys_, weights_, aggregate_, &count);
+  int32_t count = 0;
+  rocksdb::Status s = g_pika_server->db()->ZInterstore(dest_key_, keys_, weights_, aggregate_, &count);
   if (s.ok()) {
     res_.AppendInteger(count);
   } else {
@@ -628,8 +598,8 @@ void ZRankCmd::DoInitial(PikaCmdArgsType &argv, const CmdInfo* const ptr_info) {
 }
 
 void ZRankCmd::Do() {
-  int64_t rank = 0;
-  nemo::Status s = g_pika_server->db()->ZRank(key_, member_, &rank);
+  int32_t rank = 0;
+  rocksdb::Status s = g_pika_server->db()->ZRank(key_, member_, &rank);
   if (s.ok()) {
     res_.AppendInteger(rank);
   } else if (s.IsNotFound()){
@@ -648,8 +618,8 @@ void ZRevrankCmd::DoInitial(PikaCmdArgsType &argv, const CmdInfo* const ptr_info
 }
 
 void ZRevrankCmd::Do() {
-  int64_t revrank = 0;
-  nemo::Status s = g_pika_server->db()->ZRevrank(key_, member_, &revrank);
+  int32_t revrank = 0;
+  rocksdb::Status s = g_pika_server->db()->ZRevrank(key_, member_, &revrank);
   if (s.ok()) {
     res_.AppendInteger(revrank);
   } else if (s.IsNotFound()){
@@ -669,8 +639,8 @@ void ZScoreCmd::DoInitial(PikaCmdArgsType &argv, const CmdInfo* const ptr_info) 
 }
 
 void ZScoreCmd::Do() {
-  double score;
-  nemo::Status s = g_pika_server->db()->ZScore(key_, member_, &score);
+  double score = 0;
+  rocksdb::Status s = g_pika_server->db()->ZScore(key_, member_, &score);
   if (s.ok()) {
     char buf[32];
     int64_t len = slash::d2string(buf, sizeof(buf), score);
@@ -679,48 +649,54 @@ void ZScoreCmd::Do() {
   } else if (s.IsNotFound()) {
     res_.AppendContent("$-1");
   } else {
-    res_.SetRes(CmdRes::kErrOther, s.ToString());  }
+    res_.SetRes(CmdRes::kErrOther, s.ToString());
+  }
   return;
 }
 
-static nemo::Status DoMemberRange(const std::string &raw_min_member, const std::string &raw_max_member, bool *is_lo, bool *is_ro, std::string &min_member, std::string &max_member) {
+static int32_t DoMemberRange(const std::string &raw_min_member,
+                             const std::string &raw_max_member,
+                             bool *left_close,
+                             bool *right_close,
+                             std::string* min_member,
+                             std::string* max_member) {
   if (raw_min_member == "-") {
-    min_member = "-";
+    *min_member = "-";
   } else if (raw_min_member == "+") {
-    min_member = "+";
+    *min_member = "+";
   } else {
     if (raw_min_member.size() > 0 && raw_min_member.at(0) == '(') {
-      *is_lo = true;
+      *left_close = false;
     } else if (raw_min_member.size() > 0 && raw_min_member.at(0) == '[') {
-      *is_lo = false;
+      *left_close = true;
     } else {
-      return nemo::Status::Corruption("min or max not valid string range item");
+      return -1;
     }
-    min_member.assign(raw_min_member.begin() + 1, raw_min_member.end());
+    min_member->assign(raw_min_member.begin() + 1, raw_min_member.end());
   }
 
   if (raw_max_member == "+") {
-    max_member = "+";
+    *max_member = "+";
   } else if (raw_max_member == "-") {
-    max_member = "-";
+    *max_member = "-";
   } else {
     if (raw_max_member.size() > 0 && raw_max_member.at(0) == '(') {
-      *is_ro = true;
+      *right_close = false;
     } else if (raw_max_member.size() > 0 && raw_max_member.at(0) == '[') {
-      *is_ro = false;
+      *right_close = true;
     } else {
-      return nemo::Status::Corruption("min or max not valid string range item");
+      return -1;
     }
-    max_member.assign(raw_max_member.begin() + 1, raw_max_member.end());
+    max_member->assign(raw_max_member.begin() + 1, raw_max_member.end());
   }
-  return nemo::Status();
+  return 0;
 }
 
 void ZsetRangebylexParentCmd::DoInitial(PikaCmdArgsType &argv, const CmdInfo* const ptr_info) {
   (void)ptr_info;
   key_ = argv[1];
-  nemo::Status s = DoMemberRange(argv[2], argv[3], &is_lo_, &is_ro_, min_member_, max_member_);
-  if (!s.ok()) {
+  int32_t ret = DoMemberRange(argv[2], argv[3], &left_close_, &right_close_, &min_member_, &max_member_);
+  if (ret == -1) {
     res_.SetRes(CmdRes::kErrOther, "min or max not valid string range item");
     return;
   }
@@ -747,12 +723,6 @@ void ZRangebylexCmd::DoInitial(PikaCmdArgsType &argv, const CmdInfo* const ptr_i
     return;
   }
   ZsetRangebylexParentCmd::DoInitial(argv, NULL); 
-  if (min_member_ == "-") {
-    min_member_ = "";
-  }
-  if (max_member_ == "+") {
-    max_member_ = "";
-  }
 }
 
 void ZRangebylexCmd::Do() {
@@ -761,16 +731,10 @@ void ZRangebylexCmd::Do() {
     return;
   }
   std::vector<std::string> members;
-  nemo::Status s = g_pika_server->db()->ZRangebylex(key_, min_member_, max_member_, members);
-  if (!s.ok()) {
+  rocksdb::Status s = g_pika_server->db()->ZRangebylex(key_, min_member_, max_member_, left_close_, right_close_, &members);
+  if (!s.ok() && !s.IsNotFound()) {
     res_.SetRes(CmdRes::kErrOther, s.ToString());
     return;
-  }
-  if (is_lo_ && members.size() > 0 && members.front().compare(min_member_) == 0) {
-    members.erase(members.begin());
-  }
-  if (is_ro_ && members.size() > 0 && members.back().compare(max_member_) == 0) {
-    members.pop_back();
   }
   FitLimit(count_, offset_, members.size());
 
@@ -795,17 +759,10 @@ void ZRevrangebylexCmd::DoInitial(PikaCmdArgsType &argv, const CmdInfo* const pt
   min_member_ = max_member_;
   max_member_ = tmp_s;
 
-  if (min_member_ == "-") {
-    min_member_ = "";
-  }
-  if (max_member_ == "+") {
-    max_member_ = "";
-  }
-
   bool tmp_b;
-  tmp_b = is_lo_;
-  is_lo_ = is_ro_;
-  is_ro_ = tmp_b;
+  tmp_b = left_close_;
+  left_close_ = right_close_;
+  right_close_ = tmp_b;
 }
 
 void ZRevrangebylexCmd::Do() {
@@ -814,16 +771,10 @@ void ZRevrangebylexCmd::Do() {
     return;
   }
   std::vector<std::string> members;
-  nemo::Status s = g_pika_server->db()->ZRangebylex(key_, min_member_, max_member_, members);
-  if (!s.ok()) {
+  rocksdb::Status s = g_pika_server->db()->ZRangebylex(key_, min_member_, max_member_, left_close_, right_close_, &members);
+  if (!s.ok() && !s.IsNotFound()) {
     res_.SetRes(CmdRes::kErrOther, s.ToString());
     return;
-  }
-  if (is_lo_ && members.size() > 0 && members.front().compare(min_member_) == 0) {
-    members.erase(members.begin());
-  }
-  if (is_ro_ && members.size() > 0 && members.back().compare(max_member_) == 0) {
-    members.pop_back();
   }
   FitLimit(count_, offset_, members.size());
   
@@ -842,16 +793,10 @@ void ZLexcountCmd::DoInitial(PikaCmdArgsType &argv, const CmdInfo* const ptr_inf
     return;
   }
   key_ = argv[1];
-  nemo::Status s = DoMemberRange(argv[2], argv[3], &is_lo_, &is_ro_, min_member_, max_member_);
-  if (!s.ok()) {
+  int32_t ret = DoMemberRange(argv[2], argv[3], &left_close_, &right_close_, &min_member_, &max_member_);
+  if (ret == -1) {
     res_.SetRes(CmdRes::kErrOther, "min or max not valid string range item");
     return;
-  }
-  if (min_member_ == "-") {
-    min_member_ = "";
-  }
-  if (max_member_ == "+") {
-    max_member_ = "";
   }
 }
 
@@ -860,19 +805,13 @@ void ZLexcountCmd::Do() {
     res_.AppendContent(":0");
     return;
   }
-  std::vector<std::string> members;
-  nemo::Status s = g_pika_server->db()->ZRangebylex(key_, min_member_, max_member_, members);
-  if (!s.ok()) {
+  int32_t count = 0;
+  rocksdb::Status s = g_pika_server->db()->ZLexcount(key_, min_member_, max_member_, left_close_, right_close_, &count);
+  if (!s.ok() && !s.IsNotFound()) {
     res_.SetRes(CmdRes::kErrOther, s.ToString());
     return;
   }
-  if (is_lo_ && members.size() > 0 && members.front().compare(min_member_) == 0) {
-    members.erase(members.begin());
-  }
-  if (is_ro_ && members.size() > 0 && members.back().compare(max_member_) == 0) {
-    members.pop_back();
-  }
-  res_.AppendInteger(members.size());
+  res_.AppendInteger(count);
   return;
 }
 
@@ -893,11 +832,10 @@ void ZRemrangebyrankCmd::DoInitial(PikaCmdArgsType &argv, const CmdInfo* const p
 }
 
 void ZRemrangebyrankCmd::Do() {
-  int64_t count;
-  nemo::Status s = g_pika_server->db()->ZRemrangebyrank(key_, start_rank_, stop_rank_, &count);
-  if (s.ok()) {
+  int32_t count = 0;
+  rocksdb::Status s = g_pika_server->db()->ZRemrangebyrank(key_, start_rank_, stop_rank_, &count);
+  if (s.ok() || s.IsNotFound()) {
     res_.AppendInteger(count);
-    KeyNotExistsRem("z", key_);
   } else {
     res_.SetRes(CmdRes::kErrOther, s.ToString());
   }
@@ -910,8 +848,8 @@ void ZRemrangebyscoreCmd::DoInitial(PikaCmdArgsType &argv, const CmdInfo* const 
     return;
   }
   key_ = argv[1];
-  nemo::Status s = DoScoreStrRange(argv[2], argv[3], &is_lo_, &is_ro_, &min_score_, &max_score_);
-  if (!s.ok()) {
+  int32_t ret = DoScoreStrRange(argv[2], argv[3], &left_close_, &right_close_, &min_score_, &max_score_);
+  if (ret == -1) {
     res_.SetRes(CmdRes::kErrOther, "min or max is not a float");
     return;
   }
@@ -919,17 +857,16 @@ void ZRemrangebyscoreCmd::DoInitial(PikaCmdArgsType &argv, const CmdInfo* const 
 }
 
 void ZRemrangebyscoreCmd::Do() {
-  if (min_score_ == nemo::ZSET_SCORE_MAX || max_score_ == nemo::ZSET_SCORE_MIN) {
+  if (min_score_ == blackwidow::ZSET_SCORE_MAX || max_score_ == blackwidow::ZSET_SCORE_MIN) {
     res_.AppendContent(":0");
     return;
   }
-  int64_t count;
-  nemo::Status s = g_pika_server->db()->ZRemrangebyscore(key_, min_score_, max_score_, &count, is_lo_, is_ro_);
-  if (!s.ok()) {
+  int32_t count = 0;
+  rocksdb::Status s = g_pika_server->db()->ZRemrangebyscore(key_, min_score_, max_score_, left_close_, right_close_, &count);
+  if (!s.ok() && !s.IsNotFound()) {
     res_.SetRes(CmdRes::kErrOther, s.ToString());
     return;
   }
-  KeyNotExistsRem("z", key_);
   res_.AppendInteger(count);
   return;
 }
@@ -940,16 +877,10 @@ void ZRemrangebylexCmd::DoInitial(PikaCmdArgsType &argv, const CmdInfo* const pt
     return;
   }
   key_ = argv[1];
-  nemo::Status s = DoMemberRange(argv[2], argv[3], &is_lo_, &is_ro_, min_member_, max_member_);
-  if (!s.ok()) {
+  int32_t ret = DoMemberRange(argv[2], argv[3], &left_close_, &right_close_, &min_member_, &max_member_);
+  if (ret == -1) {
     res_.SetRes(CmdRes::kErrOther, "min or max not valid string range item");
     return;
-  }
-  if (min_member_ == "-") {
-    min_member_ = "";
-  }
-  if (max_member_ == "+") {
-    max_member_ = "";
   }
   return;
 }
@@ -959,13 +890,12 @@ void ZRemrangebylexCmd::Do() {
     res_.AppendContent("*0");
     return;
   }
-  int64_t count;
-  nemo::Status s = g_pika_server->db()->ZRemrangebylex(key_, min_member_, max_member_, is_lo_, is_ro_, &count);
-  if (!s.ok()) {
+  int32_t count = 0;
+  rocksdb::Status s = g_pika_server->db()->ZRemrangebylex(key_, min_member_, max_member_, left_close_, right_close_, &count);
+  if (!s.ok() && !s.IsNotFound()) {
     res_.SetRes(CmdRes::kErrOther, s.ToString());
     return;
   }
-  KeyNotExistsRem("z", key_);
   res_.AppendInteger(count);
   return;
 }

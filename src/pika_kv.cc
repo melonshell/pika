@@ -4,10 +4,8 @@
 // of patent rights can be found in the PATENTS file in the same directory.
 
 #include "slash/include/slash_string.h"
-#include "nemo.h"
 #include "include/pika_kv.h"
 #include "include/pika_server.h"
-#include "include/pika_slot.h"
 
 extern PikaServer *g_pika_server;
 
@@ -27,6 +25,15 @@ void SetCmd::DoInitial(PikaCmdArgsType &argv, const CmdInfo* const ptr_info) {
       condition_ = SetCmd::kXX;
     } else if (opt == "nx") {
       condition_ = SetCmd::kNX;
+    } else if (opt == "vx") {
+      condition_ = SetCmd::kVX;
+      index++;
+      if (index == argv.size()) {
+        res_.SetRes(CmdRes::kSyntaxErr);
+        return;
+      } else {
+        target_ = argv[index];
+      }
     } else if (opt == "ex" || opt == "px") {
       index++;
       if (index == argv.size()) {
@@ -50,8 +57,8 @@ void SetCmd::DoInitial(PikaCmdArgsType &argv, const CmdInfo* const ptr_info) {
 }
 
 void SetCmd::Do() {
-  nemo::Status s;
-  int64_t res = 1;
+  rocksdb::Status s;
+  int32_t res = 1;
   switch (condition_) {
     case SetCmd::kXX:
       s = g_pika_server->db()->Setxx(key_, value_, &res, sec_);
@@ -59,18 +66,24 @@ void SetCmd::Do() {
     case SetCmd::kNX:
       s = g_pika_server->db()->Setnx(key_, value_, &res, sec_);
       break;
+    case SetCmd::kVX:
+      s = g_pika_server->db()->Setvx(key_, target_, value_, &success_, sec_);
+      break;
     default:
       s = g_pika_server->db()->Set(key_, value_, sec_);
       break;
   }
 
   if (s.ok() || s.IsNotFound()) {
-    if (res == 1) {
-      res_.SetRes(CmdRes::kOk);
+    if (condition_ == SetCmd::kVX) {
+      res_.AppendInteger(success_);
     } else {
-      res_.AppendArrayLen(-1);;
+      if (res == 1) {
+        res_.SetRes(CmdRes::kOk);
+      } else {
+        res_.AppendArrayLen(-1);;
+      }
     }
-    SlotKeyAdd("k", key_);
   } else {
     res_.SetRes(CmdRes::kErrOther, s.ToString());
   }
@@ -87,7 +100,7 @@ void GetCmd::DoInitial(PikaCmdArgsType &argv, const CmdInfo* const ptr_info) {
 
 void GetCmd::Do() {
   std::string value;
-  nemo::Status s = g_pika_server->db()->Get(key_, &value);
+  rocksdb::Status s = g_pika_server->db()->Get(key_, &value);
   if (s.ok()) {
     res_.AppendStringLen(value.size());
     res_.AppendContent(value);
@@ -109,16 +122,12 @@ void DelCmd::DoInitial(PikaCmdArgsType &argv, const CmdInfo* const ptr_info) {
 }
 
 void DelCmd::Do() {
-  int64_t count = 0;
-  std::vector<std::string>::const_iterator it;
-  for (it = keys_.begin(); it != keys_.end(); it++) {
-    SlotKeyRem(*it);
-  }
-  nemo::Status s = g_pika_server->db()->MDel(keys_, &count);
-  if (s.ok()) {
+  std::map<blackwidow::DataType, blackwidow::Status> type_status;
+  int64_t count = g_pika_server->db()->Del(keys_, &type_status);
+  if (count >= 0) {
     res_.AppendInteger(count);
   } else {
-    res_.SetRes(CmdRes::kErrOther, s.ToString());
+    res_.SetRes(CmdRes::kErrOther, "delete error");
   }
   return;
 }
@@ -133,11 +142,10 @@ void IncrCmd::DoInitial(PikaCmdArgsType &argv, const CmdInfo* const ptr_info) {
 }
 
 void IncrCmd::Do() {
-  nemo::Status s = g_pika_server->db()->Incrby(key_, 1, new_value_);
+  rocksdb::Status s = g_pika_server->db()->Incrby(key_, 1, &new_value_);
   if (s.ok()) {
-   res_.AppendContent(":" + new_value_);
-   SlotKeyAdd("k", key_);
-  } else if (s.IsCorruption() && s.ToString() == "Corruption: value is not a integer") {
+   res_.AppendContent(":" + std::to_string(new_value_));
+  } else if (s.IsCorruption() && s.ToString() == "Corruption: Value is not a integer") {
     res_.SetRes(CmdRes::kInvalidInt);
   } else if (s.IsInvalidArgument()) {
     res_.SetRes(CmdRes::kOverFlow);
@@ -148,27 +156,36 @@ void IncrCmd::Do() {
 }
 
 std::string IncrCmd::ToBinlog(
-    const PikaCmdArgsType& argv,
-    const std::string& server_id,
-    const std::string& binlog_info,
-    bool need_send_to_hub) {
-  std::string res;
-  res.reserve(RAW_ARGS_LEN);
-  RedisAppendLen(res, 3 + 4, "*");
+      const PikaCmdArgsType& argv,
+      uint32_t exec_time,
+      const std::string& server_id,
+      uint64_t logic_id,
+      uint32_t filenum,
+      uint64_t offset) {
+  std::string content;
+  content.reserve(RAW_ARGS_LEN);
+  RedisAppendLen(content, 3, "*");
 
   // to set cmd
   std::string set_cmd("set");
-  RedisAppendLen(res, set_cmd.size(), "$");
-  RedisAppendContent(res, set_cmd);
+  RedisAppendLen(content, set_cmd.size(), "$");
+  RedisAppendContent(content, set_cmd);
   // key
-  RedisAppendLen(res, key_.size(), "$");
-  RedisAppendContent(res, key_);
+  RedisAppendLen(content, key_.size(), "$");
+  RedisAppendContent(content, key_);
   // value
-  RedisAppendLen(res, new_value_.size(), "$");
-  RedisAppendContent(res, new_value_);
+  std::string value = std::to_string(new_value_);
+  RedisAppendLen(content, value.size(), "$");
+  RedisAppendContent(content, value);
 
-  AppendAffiliatedInfo(res, server_id, binlog_info, need_send_to_hub);
-  return res;
+  return PikaBinlogTransverter::BinlogEncode(BinlogType::TypeFirst,
+                                             exec_time,
+                                             std::stoi(server_id),
+                                             logic_id,
+                                             filenum,
+                                             offset,
+                                             content,
+                                             {});
 }
 
 void IncrbyCmd::DoInitial(PikaCmdArgsType &argv, const CmdInfo* const ptr_info) {
@@ -185,11 +202,10 @@ void IncrbyCmd::DoInitial(PikaCmdArgsType &argv, const CmdInfo* const ptr_info) 
 }
 
 void IncrbyCmd::Do() {
-  nemo::Status s = g_pika_server->db()->Incrby(key_, by_, new_value_);
+  rocksdb::Status s = g_pika_server->db()->Incrby(key_, by_, &new_value_);
   if (s.ok()) {
-    res_.AppendContent(":" + new_value_);
-    SlotKeyAdd("k", key_);
-  } else if (s.IsCorruption() && s.ToString() == "Corruption: value is not a integer") {
+    res_.AppendContent(":" + std::to_string(new_value_));
+  } else if (s.IsCorruption() && s.ToString() == "Corruption: Value is not a integer") {
     res_.SetRes(CmdRes::kInvalidInt);
   } else if (s.IsInvalidArgument()) {
     res_.SetRes(CmdRes::kOverFlow);
@@ -200,27 +216,36 @@ void IncrbyCmd::Do() {
 }
 
 std::string IncrbyCmd::ToBinlog(
-    const PikaCmdArgsType& argv,
-    const std::string& server_id,
-    const std::string& binlog_info,
-    bool need_send_to_hub) {
-  std::string res;
-  res.reserve(RAW_ARGS_LEN);
-  RedisAppendLen(res, 3 + 4, "*");
+      const PikaCmdArgsType& argv,
+      uint32_t exec_time,
+      const std::string& server_id,
+      uint64_t logic_id,
+      uint32_t filenum,
+      uint64_t offset) {
+  std::string content;
+  content.reserve(RAW_ARGS_LEN);
+  RedisAppendLen(content, 3, "*");
 
   // to set cmd
   std::string set_cmd("set");
-  RedisAppendLen(res, set_cmd.size(), "$");
-  RedisAppendContent(res, set_cmd);
+  RedisAppendLen(content, set_cmd.size(), "$");
+  RedisAppendContent(content, set_cmd);
   // key
-  RedisAppendLen(res, key_.size(), "$");
-  RedisAppendContent(res, key_);
+  RedisAppendLen(content, key_.size(), "$");
+  RedisAppendContent(content, key_);
   // value
-  RedisAppendLen(res, new_value_.size(), "$");
-  RedisAppendContent(res, new_value_);
+  std::string value = std::to_string(new_value_);
+  RedisAppendLen(content, value.size(), "$");
+  RedisAppendContent(content, value);
 
-  AppendAffiliatedInfo(res, server_id, binlog_info, need_send_to_hub);
-  return res;
+  return PikaBinlogTransverter::BinlogEncode(BinlogType::TypeFirst,
+                                             exec_time,
+                                             std::stoi(server_id),
+                                             logic_id,
+                                             filenum,
+                                             offset,
+                                             content,
+                                             {});
 }
 
 void IncrbyfloatCmd::DoInitial(PikaCmdArgsType &argv, const CmdInfo* const ptr_info) {
@@ -229,6 +254,7 @@ void IncrbyfloatCmd::DoInitial(PikaCmdArgsType &argv, const CmdInfo* const ptr_i
     return;
   }
   key_ = argv[1];
+  value_ = argv[2];
   if (!slash::string2d(argv[2].data(), argv[2].size(), &by_)) {
     res_.SetRes(CmdRes::kInvalidFloat);
     return;
@@ -237,12 +263,11 @@ void IncrbyfloatCmd::DoInitial(PikaCmdArgsType &argv, const CmdInfo* const ptr_i
 }
 
 void IncrbyfloatCmd::Do() {
-  nemo::Status s = g_pika_server->db()->Incrbyfloat(key_, by_, new_value_);
+  rocksdb::Status s = g_pika_server->db()->Incrbyfloat(key_, value_, &new_value_);
   if (s.ok()) {
     res_.AppendStringLen(new_value_.size());
     res_.AppendContent(new_value_);
-    SlotKeyAdd("k", key_);
-  } else if (s.IsCorruption() && s.ToString() == "Corruption: value is not a float"){
+  } else if (s.IsCorruption() && s.ToString() == "Corruption: Value is not a vaild float"){
     res_.SetRes(CmdRes::kInvalidFloat);
   } else if (s.IsInvalidArgument()) {
     res_.SetRes(CmdRes::kOverFlow);
@@ -253,27 +278,35 @@ void IncrbyfloatCmd::Do() {
 }
 
 std::string IncrbyfloatCmd::ToBinlog(
-    const PikaCmdArgsType& argv,
-    const std::string& server_id,
-    const std::string& binlog_info,
-    bool need_send_to_hub) {
-  std::string res;
-  res.reserve(RAW_ARGS_LEN);
-  RedisAppendLen(res, 3 + 4, "*");
+      const PikaCmdArgsType& argv,
+      uint32_t exec_time,
+      const std::string& server_id,
+      uint64_t logic_id,
+      uint32_t filenum,
+      uint64_t offset) {
+  std::string content;
+  content.reserve(RAW_ARGS_LEN);
+  RedisAppendLen(content, 3, "*");
 
   // to set cmd
   std::string set_cmd("set");
-  RedisAppendLen(res, set_cmd.size(), "$");
-  RedisAppendContent(res, set_cmd);
+  RedisAppendLen(content, set_cmd.size(), "$");
+  RedisAppendContent(content, set_cmd);
   // key
-  RedisAppendLen(res, key_.size(), "$");
-  RedisAppendContent(res, key_);
+  RedisAppendLen(content, key_.size(), "$");
+  RedisAppendContent(content, key_);
   // value
-  RedisAppendLen(res, new_value_.size(), "$");
-  RedisAppendContent(res, new_value_);
+  RedisAppendLen(content, new_value_.size(), "$");
+  RedisAppendContent(content, new_value_);
 
-  AppendAffiliatedInfo(res, server_id, binlog_info, need_send_to_hub);
-  return res;
+  return PikaBinlogTransverter::BinlogEncode(BinlogType::TypeFirst,
+                                             exec_time,
+                                             std::stoi(server_id),
+                                             logic_id,
+                                             filenum,
+                                             offset,
+                                             content,
+                                             {});
 }
 
 void DecrCmd::DoInitial(PikaCmdArgsType &argv, const CmdInfo* const ptr_info) {
@@ -286,10 +319,10 @@ void DecrCmd::DoInitial(PikaCmdArgsType &argv, const CmdInfo* const ptr_info) {
 }
 
 void DecrCmd::Do() {
-  nemo::Status s = g_pika_server->db()->Decrby(key_, 1, new_value_);
+  rocksdb::Status s = g_pika_server->db()->Decrby(key_, 1, &new_value_);
   if (s.ok()) {
-   res_.AppendContent(":" + new_value_);
-  } else if (s.IsCorruption() && s.ToString() == "Corruption: value is not a integer") {
+   res_.AppendContent(":" + std::to_string(new_value_));
+  } else if (s.IsCorruption() && s.ToString() == "Corruption: Value is not a integer") {
     res_.SetRes(CmdRes::kInvalidInt);
   } else if (s.IsInvalidArgument()) {
     res_.SetRes(CmdRes::kOverFlow);
@@ -300,27 +333,36 @@ void DecrCmd::Do() {
 }
 
 std::string DecrCmd::ToBinlog(
-    const PikaCmdArgsType& argv,
-    const std::string& server_id,
-    const std::string& binlog_info,
-    bool need_send_to_hub) {
-  std::string res;
-  res.reserve(RAW_ARGS_LEN);
-  RedisAppendLen(res, 3 + 4, "*");
+      const PikaCmdArgsType& argv,
+      uint32_t exec_time,
+      const std::string& server_id,
+      uint64_t logic_id,
+      uint32_t filenum,
+      uint64_t offset) {
+  std::string content;
+  content.reserve(RAW_ARGS_LEN);
+  RedisAppendLen(content, 3, "*");
 
   // to set cmd
   std::string set_cmd("set");
-  RedisAppendLen(res, set_cmd.size(), "$");
-  RedisAppendContent(res, set_cmd);
+  RedisAppendLen(content, set_cmd.size(), "$");
+  RedisAppendContent(content, set_cmd);
   // key
-  RedisAppendLen(res, key_.size(), "$");
-  RedisAppendContent(res, key_);
+  RedisAppendLen(content, key_.size(), "$");
+  RedisAppendContent(content, key_);
   // value
-  RedisAppendLen(res, new_value_.size(), "$");
-  RedisAppendContent(res, new_value_);
+  std::string value = std::to_string(new_value_);
+  RedisAppendLen(content, value.size(), "$");
+  RedisAppendContent(content, value);
 
-  AppendAffiliatedInfo(res, server_id, binlog_info, need_send_to_hub);
-  return res;
+  return PikaBinlogTransverter::BinlogEncode(BinlogType::TypeFirst,
+                                             exec_time,
+                                             std::stoi(server_id),
+                                             logic_id,
+                                             filenum,
+                                             offset,
+                                             content,
+                                             {});
 }
 
 void DecrbyCmd::DoInitial(PikaCmdArgsType &argv, const CmdInfo* const ptr_info) {
@@ -337,10 +379,10 @@ void DecrbyCmd::DoInitial(PikaCmdArgsType &argv, const CmdInfo* const ptr_info) 
 }
 
 void DecrbyCmd::Do() {
-  nemo::Status s = g_pika_server->db()->Decrby(key_, by_, new_value_);
+  rocksdb::Status s = g_pika_server->db()->Decrby(key_, by_, &new_value_);
   if (s.ok()) {
-    res_.AppendContent(":" + new_value_);
-  } else if (s.IsCorruption() && s.ToString() == "Corruption: value is not a integer") {
+    res_.AppendContent(":" + std::to_string(new_value_));
+  } else if (s.IsCorruption() && s.ToString() == "Corruption: Value is not a integer") {
     res_.SetRes(CmdRes::kInvalidInt);
   } else if (s.IsInvalidArgument()) {
     res_.SetRes(CmdRes::kOverFlow);
@@ -351,27 +393,36 @@ void DecrbyCmd::Do() {
 }
 
 std::string DecrbyCmd::ToBinlog(
-    const PikaCmdArgsType& argv,
-    const std::string& server_id,
-    const std::string& binlog_info,
-    bool need_send_to_hub) {
-  std::string res;
-  res.reserve(RAW_ARGS_LEN);
-  RedisAppendLen(res, 3 + 4, "*");
+      const PikaCmdArgsType& argv,
+      uint32_t exec_time,
+      const std::string& server_id,
+      uint64_t logic_id,
+      uint32_t filenum,
+      uint64_t offset) {
+  std::string content;
+  content.reserve(RAW_ARGS_LEN);
+  RedisAppendLen(content, 3, "*");
 
   // to set cmd
   std::string set_cmd("set");
-  RedisAppendLen(res, set_cmd.size(), "$");
-  RedisAppendContent(res, set_cmd);
+  RedisAppendLen(content, set_cmd.size(), "$");
+  RedisAppendContent(content, set_cmd);
   // key
-  RedisAppendLen(res, key_.size(), "$");
-  RedisAppendContent(res, key_);
+  RedisAppendLen(content, key_.size(), "$");
+  RedisAppendContent(content, key_);
   // value
-  RedisAppendLen(res, new_value_.size(), "$");
-  RedisAppendContent(res, new_value_);
+  std::string value = std::to_string(new_value_);
+  RedisAppendLen(content, value.size(), "$");
+  RedisAppendContent(content, value);
 
-  AppendAffiliatedInfo(res, server_id, binlog_info, need_send_to_hub);
-  return res;
+  return PikaBinlogTransverter::BinlogEncode(BinlogType::TypeFirst,
+                                             exec_time,
+                                             std::stoi(server_id),
+                                             logic_id,
+                                             filenum,
+                                             offset,
+                                             content,
+                                             {});
 }
 
 void GetsetCmd::DoInitial(PikaCmdArgsType &argv, const CmdInfo* const ptr_info) {
@@ -386,7 +437,7 @@ void GetsetCmd::DoInitial(PikaCmdArgsType &argv, const CmdInfo* const ptr_info) 
 
 void GetsetCmd::Do() {
   std::string old_value;
-  nemo::Status s = g_pika_server->db()->GetSet(key_, new_value_, &old_value);
+  rocksdb::Status s = g_pika_server->db()->GetSet(key_, new_value_, &old_value);
   if (s.ok()) {
     if (old_value.empty()) {
       res_.AppendContent("$-1");
@@ -394,7 +445,6 @@ void GetsetCmd::Do() {
       res_.AppendStringLen(old_value.size());
       res_.AppendContent(old_value);
     }
-    SlotKeyAdd("k", key_);
   } else {
     res_.SetRes(CmdRes::kErrOther, s.ToString());
   }
@@ -412,11 +462,10 @@ void AppendCmd::DoInitial(PikaCmdArgsType &argv, const CmdInfo* const ptr_info) 
 }
 
 void AppendCmd::Do() {
-  int64_t new_len = 0;
-  nemo::Status s = g_pika_server->db()->Append(key_, value_, &new_len);
+  int32_t new_len = 0;
+  rocksdb::Status s = g_pika_server->db()->Append(key_, value_, &new_len);
   if (s.ok() || s.IsNotFound()) {
     res_.AppendInteger(new_len);
-    SlotKeyAdd("k", key_);
   } else {
     res_.SetRes(CmdRes::kErrOther, s.ToString());
   }
@@ -434,14 +483,13 @@ void MgetCmd::DoInitial(PikaCmdArgsType &argv, const CmdInfo* const ptr_info) {
 }
 
 void MgetCmd::Do() {
-  std::vector<nemo::KVS> kvs_v;
-  nemo::Status s = g_pika_server->db()->MGet(keys_, kvs_v);
-  res_.AppendArrayLen(kvs_v.size());
-  std::vector<nemo::KVS>::const_iterator iter;
-  for (iter = kvs_v.begin(); iter != kvs_v.end(); iter++) {
-    if ((iter->status).ok()) {
-      res_.AppendStringLen((iter->val).size());
-      res_.AppendContent(iter->val);
+  std::vector<std::string> values;
+  rocksdb::Status s = g_pika_server->db()->MGet(keys_, &values);
+  res_.AppendArrayLen(values.size());
+  for (const auto& value : values) {
+    if (!value.empty()) {
+      res_.AppendStringLen(value.size());
+      res_.AppendContent(value);
     } else {
       res_.AppendContent("$-1");
     }
@@ -470,11 +518,10 @@ void KeysCmd::DoInitial(PikaCmdArgsType &argv, const CmdInfo* const ptr_info) {
 
 void KeysCmd::Do() {
   std::vector<std::string> keys;
-  nemo::Status s = g_pika_server->db()->Keys(pattern_, keys, type_);
+  rocksdb::Status s = g_pika_server->db()->Keys(type_, pattern_, &keys);
   res_.AppendArrayLen(keys.size());
-  for (std::vector<std::string>::iterator iter = keys.begin(); iter != keys.end(); iter++) {
-    res_.AppendStringLen(iter->size());
-    res_.AppendContent(*iter);
+  for (const auto& key : keys) {
+    res_.AppendString(key);
   }
   return;
 }
@@ -491,10 +538,9 @@ void SetnxCmd::DoInitial(PikaCmdArgsType &argv, const CmdInfo* const ptr_info) {
 
 void SetnxCmd::Do() {
   success_ = 0;
-  nemo::Status s = g_pika_server->db()->Setnx(key_, value_, &success_);
+  rocksdb::Status s = g_pika_server->db()->Setnx(key_, value_, &success_);
   if (s.ok()) {
     res_.AppendInteger(success_);
-    SlotKeyAdd("k", key_);
   } else {
     res_.SetRes(CmdRes::kErrOther, s.ToString());
   }
@@ -502,29 +548,38 @@ void SetnxCmd::Do() {
 }
 
 std::string SetnxCmd::ToBinlog(
-    const PikaCmdArgsType& argv,
-    const std::string& server_id,
-    const std::string& binlog_info,
-    bool need_send_to_hub) {
-  std::string res;
+      const PikaCmdArgsType& argv,
+      uint32_t exec_time,
+      const std::string& server_id,
+      uint64_t logic_id,
+      uint32_t filenum,
+      uint64_t offset) {
+  std::string content;
   if (success_) {
-    res.reserve(RAW_ARGS_LEN);
-    RedisAppendLen(res, 3 + 4, "*");
+    content.reserve(RAW_ARGS_LEN);
+    RedisAppendLen(content, 3, "*");
 
     // to set cmd
     std::string set_cmd("set");
-    RedisAppendLen(res, set_cmd.size(), "$");
-    RedisAppendContent(res, set_cmd);
+    RedisAppendLen(content, set_cmd.size(), "$");
+    RedisAppendContent(content, set_cmd);
     // key
-    RedisAppendLen(res, key_.size(), "$");
-    RedisAppendContent(res, key_);
+    RedisAppendLen(content, key_.size(), "$");
+    RedisAppendContent(content, key_);
     // value
-    RedisAppendLen(res, value_.size(), "$");
-    RedisAppendContent(res, value_);
+    RedisAppendLen(content, value_.size(), "$");
+    RedisAppendContent(content, value_);
 
-    AppendAffiliatedInfo(res, server_id, binlog_info, need_send_to_hub);
+    return PikaBinlogTransverter::BinlogEncode(BinlogType::TypeFirst,
+                                               exec_time,
+                                               std::stoi(server_id),
+                                               logic_id,
+                                               filenum,
+                                               offset,
+                                               content,
+                                               {});
   }
-  return res;
+  return content;
 }
 
 void SetexCmd::DoInitial(PikaCmdArgsType &argv, const CmdInfo* const ptr_info) {
@@ -542,10 +597,51 @@ void SetexCmd::DoInitial(PikaCmdArgsType &argv, const CmdInfo* const ptr_info) {
 }
 
 void SetexCmd::Do() {
-  nemo::Status s = g_pika_server->db()->Set(key_, value_, sec_);
+  rocksdb::Status s = g_pika_server->db()->Setex(key_, value_, sec_);
   if (s.ok()) {
     res_.SetRes(CmdRes::kOk);
-    SlotKeyAdd("k", key_);
+  } else {
+    res_.SetRes(CmdRes::kErrOther, s.ToString());
+  }
+}
+
+void PsetexCmd::DoInitial(PikaCmdArgsType &argv, const CmdInfo* const ptr_info) {
+  if (!ptr_info->CheckArg(argv.size())) {
+    res_.SetRes(CmdRes::kWrongNum, kCmdNamePsetex);
+    return;
+  }
+  key_ = argv[1];
+  if (!slash::string2l(argv[2].data(), argv[2].size(), &usec_)) {
+    res_.SetRes(CmdRes::kInvalidInt);
+    return;
+  }
+  value_ = argv[3];
+  return;
+}
+
+void PsetexCmd::Do() {
+  rocksdb::Status s = g_pika_server->db()->Setex(key_, value_, usec_ / 1000);
+  if (s.ok()) {
+    res_.SetRes(CmdRes::kOk);
+  } else {
+    res_.SetRes(CmdRes::kErrOther, s.ToString());
+  }
+}
+
+void DelvxCmd::DoInitial(PikaCmdArgsType &argv, const CmdInfo* const ptr_info) {
+  if (!ptr_info->CheckArg(argv.size())) {
+    res_.SetRes(CmdRes::kWrongNum, kCmdNameDelvx);
+    return;
+  }
+  key_ = argv[1];
+  value_ = argv[2];
+  return;
+}
+
+void DelvxCmd::Do() {
+  rocksdb::Status s = g_pika_server->db()->Delvx(key_, value_, &success_);
+  if (s.ok() || s.IsNotFound()) {
+    res_.AppendInteger(success_);
   } else {
     res_.SetRes(CmdRes::kErrOther, s.ToString());
   }
@@ -563,50 +659,55 @@ void MsetCmd::DoInitial(PikaCmdArgsType &argv, const CmdInfo* const ptr_info) {
   }
   kvs_.clear();
   for (size_t index = 1; index != argc; index += 2) {
-    kvs_.push_back({argv[index], argv[index+1]});
+    kvs_.push_back({argv[index], argv[index + 1]});
   }
   return;
 }
 
 void MsetCmd::Do() {
-  nemo::Status s = g_pika_server->db()->MSet(kvs_);
+  blackwidow::Status s = g_pika_server->db()->MSet(kvs_);
   if (s.ok()) {
     res_.SetRes(CmdRes::kOk);
-    std::vector<nemo::KV>::const_iterator it;
-    for (it = kvs_.begin(); it != kvs_.end(); it++) {
-      SlotKeyAdd("k", it->key);
-    }
   } else {
     res_.SetRes(CmdRes::kErrOther, s.ToString());
   }
 }
 
 std::string MsetCmd::ToBinlog(
-    const PikaCmdArgsType& argv,
-    const std::string& server_id,
-    const std::string& binlog_info,
-    bool need_send_to_hub) {
-  std::string res;
-  res.reserve(RAW_ARGS_LEN);
+      const PikaCmdArgsType& argv,
+      uint32_t exec_time,
+      const std::string& server_id,
+      uint64_t logic_id,
+      uint32_t filenum,
+      uint64_t offset) {
+  std::string content, binlog;
 
-  std::vector<nemo::KV>::const_iterator it;
+  std::vector<blackwidow::KeyValue>::const_iterator it;
   for (it = kvs_.begin(); it != kvs_.end(); it++) {
-    RedisAppendLen(res, 3 + 4, "*");
+    content.clear();
+    RedisAppendLen(content, 3, "*");
 
     // to set cmd
     std::string set_cmd("set");
-    RedisAppendLen(res, set_cmd.size(), "$");
-    RedisAppendContent(res, set_cmd);
+    RedisAppendLen(content, set_cmd.size(), "$");
+    RedisAppendContent(content, set_cmd);
     // key
-    RedisAppendLen(res, it->key.size(), "$");
-    RedisAppendContent(res, it->key);
+    RedisAppendLen(content, it->key.size(), "$");
+    RedisAppendContent(content, it->key);
     // value
-    RedisAppendLen(res, it->val.size(), "$");
-    RedisAppendContent(res, it->val);
+    RedisAppendLen(content, it->value.size(), "$");
+    RedisAppendContent(content, it->value);
 
-    AppendAffiliatedInfo(res, server_id, binlog_info, need_send_to_hub);
+    binlog += PikaBinlogTransverter::BinlogEncode(BinlogType::TypeFirst,
+                                                  exec_time,
+                                                  std::stoi(server_id),
+                                                  logic_id,
+                                                  filenum,
+                                                  offset,
+                                                  content,
+                                                  {});
   }
-  return res;
+  return binlog;
 }
 
 void MsetnxCmd::DoInitial(PikaCmdArgsType &argv, const CmdInfo* const ptr_info) {
@@ -621,53 +722,58 @@ void MsetnxCmd::DoInitial(PikaCmdArgsType &argv, const CmdInfo* const ptr_info) 
   }
   kvs_.clear();
   for (size_t index = 1; index != argc; index += 2) {
-    kvs_.push_back({argv[index], argv[index+1]});
+    kvs_.push_back({argv[index], argv[index + 1]});
   }
   return;
 }
 
 void MsetnxCmd::Do() {
   success_ = 0;
-  nemo::Status s = g_pika_server->db()->MSetnx(kvs_, &success_);
+  rocksdb::Status s = g_pika_server->db()->MSetnx(kvs_, &success_);
   if (s.ok()) {
     res_.AppendInteger(success_);
-    std::vector<nemo::KV>::const_iterator it;
-    for (it = kvs_.begin(); it != kvs_.end(); it++) {
-      SlotKeyAdd("k", it->key);
-    }
   } else {
     res_.SetRes(CmdRes::kErrOther, s.ToString());
   }
 }
 
 std::string MsetnxCmd::ToBinlog(
-    const PikaCmdArgsType& argv,
-    const std::string& server_id,
-    const std::string& binlog_info,
-    bool need_send_to_hub) {
-  std::string res;
+      const PikaCmdArgsType& argv,
+      uint32_t exec_time,
+      const std::string& server_id,
+      uint64_t logic_id,
+      uint32_t filenum,
+      uint64_t offset) {
+  std::string content, binlogs;
   if (success_) {
-    res.reserve(RAW_ARGS_LEN);
 
-    std::vector<nemo::KV>::const_iterator it;
+    std::vector<blackwidow::KeyValue>::const_iterator it;
     for (it = kvs_.begin(); it != kvs_.end(); it++) {
-      RedisAppendLen(res, 3 + 4, "*");
+      content.clear();
+      RedisAppendLen(content, 3, "*");
 
       // to set cmd
       std::string set_cmd("set");
-      RedisAppendLen(res, set_cmd.size(), "$");
-      RedisAppendContent(res, set_cmd);
+      RedisAppendLen(content, set_cmd.size(), "$");
+      RedisAppendContent(content, set_cmd);
       // key
-      RedisAppendLen(res, it->key.size(), "$");
-      RedisAppendContent(res, it->key);
+      RedisAppendLen(content, it->key.size(), "$");
+      RedisAppendContent(content, it->key);
       // value
-      RedisAppendLen(res, it->val.size(), "$");
-      RedisAppendContent(res, it->val);
+      RedisAppendLen(content, it->value.size(), "$");
+      RedisAppendContent(content, it->value);
 
-      AppendAffiliatedInfo(res, server_id, binlog_info, need_send_to_hub);
+      binlogs += PikaBinlogTransverter::BinlogEncode(BinlogType::TypeFirst,
+                                                     exec_time,
+                                                     std::stoi(server_id),
+                                                     logic_id,
+                                                     filenum,
+                                                     offset,
+                                                     content,
+                                                     {});
     }
   }
-  return res;
+  return binlogs;
 }
 
 void GetrangeCmd::DoInitial(PikaCmdArgsType &argv, const CmdInfo* const ptr_info) {
@@ -689,7 +795,7 @@ void GetrangeCmd::DoInitial(PikaCmdArgsType &argv, const CmdInfo* const ptr_info
 
 void GetrangeCmd::Do() {
   std::string substr;
-  nemo::Status s = g_pika_server->db()->Getrange(key_, start_, end_, substr);
+  rocksdb::Status s = g_pika_server->db()->Getrange(key_, start_, end_, &substr);
   if (s.ok() || s.IsNotFound()) {
     res_.AppendStringLen(substr.size());
     res_.AppendContent(substr);
@@ -713,11 +819,10 @@ void SetrangeCmd::DoInitial(PikaCmdArgsType &argv, const CmdInfo* const ptr_info
 }
 
 void SetrangeCmd::Do() {
-  int64_t new_len;
-  nemo::Status s = g_pika_server->db()->Setrange(key_, offset_, value_, &new_len);
+  int32_t new_len;
+  rocksdb::Status s = g_pika_server->db()->Setrange(key_, offset_, value_, &new_len);
   if (s.ok()) {
     res_.AppendInteger(new_len);
-    SlotKeyAdd("k", key_);
   } else {
     res_.SetRes(CmdRes::kErrOther, s.ToString());
   }
@@ -734,8 +839,8 @@ void StrlenCmd::DoInitial(PikaCmdArgsType &argv, const CmdInfo* const ptr_info) 
 }
 
 void StrlenCmd::Do() {
-  int64_t len = 0;
-  nemo::Status s = g_pika_server->db()->Strlen(key_, &len);
+  int32_t len = 0;
+  rocksdb::Status s = g_pika_server->db()->Strlen(key_, &len);
   if (s.ok() || s.IsNotFound()) {
     res_.AppendInteger(len);
   } else {
@@ -755,13 +860,12 @@ void ExistsCmd::DoInitial(PikaCmdArgsType &argv, const CmdInfo* const ptr_info) 
 }
 
 void ExistsCmd::Do() {
-  int64_t res;
-
-  nemo::Status s = g_pika_server->db()->Exists(keys_, &res);
-  if (s.ok() || s.IsNotFound()) {
+  std::map<blackwidow::DataType, rocksdb::Status> type_status;
+  int64_t res = g_pika_server->db()->Exists(keys_, &type_status);
+  if (res != -1) {
     res_.AppendInteger(res);
   } else {
-    res_.SetRes(CmdRes::kErrOther, s.ToString());
+    res_.SetRes(CmdRes::kErrOther, "exists internal error");
   }
   return;
 }
@@ -780,42 +884,50 @@ void ExpireCmd::DoInitial(PikaCmdArgsType &argv, const CmdInfo* const ptr_info) 
 }
 
 void ExpireCmd::Do() {
-  int64_t res = 0;
-  nemo::Status s = g_pika_server->db()->Expire(key_, sec_, &res);
-  if (s.ok() || s.IsNotFound()) {
+  std::map<blackwidow::DataType, rocksdb::Status> type_status;
+  int64_t res = g_pika_server->db()->Expire(key_, sec_, &type_status);
+  if (res != -1) {
     res_.AppendInteger(res);
   } else {
-    res_.SetRes(CmdRes::kErrOther, s.ToString());
+    res_.SetRes(CmdRes::kErrOther, "expire internal error");
   }
   return;
 }
 
 std::string ExpireCmd::ToBinlog(
-    const PikaCmdArgsType& argv,
-    const std::string& server_id,
-    const std::string& binlog_info,
-    bool need_send_to_hub) {
-  std::string res;
-  res.reserve(RAW_ARGS_LEN);
-  RedisAppendLen(res, argv.size() + 4, "*");
+      const PikaCmdArgsType& argv,
+      uint32_t exec_time,
+      const std::string& server_id,
+      uint64_t logic_id,
+      uint32_t filenum,
+      uint64_t offset) {
+  std::string content;
+  content.reserve(RAW_ARGS_LEN);
+  RedisAppendLen(content, argv.size(), "*");
 
   // to expireat cmd
   std::string expireat_cmd("expireat");
-  RedisAppendLen(res, expireat_cmd.size(), "$");
-  RedisAppendContent(res, expireat_cmd);
+  RedisAppendLen(content, expireat_cmd.size(), "$");
+  RedisAppendContent(content, expireat_cmd);
   // key
-  RedisAppendLen(res, key_.size(), "$");
-  RedisAppendContent(res, key_);
+  RedisAppendLen(content, key_.size(), "$");
+  RedisAppendContent(content, key_);
   // sec
   char buf[100];
   int64_t expireat = time(nullptr) + sec_;
   slash::ll2string(buf, 100, expireat);
   std::string at(buf);
-  RedisAppendLen(res, at.size(), "$");
-  RedisAppendContent(res, at);
+  RedisAppendLen(content, at.size(), "$");
+  RedisAppendContent(content, at);
 
-  AppendAffiliatedInfo(res, server_id, binlog_info, need_send_to_hub);
-  return res;
+  return PikaBinlogTransverter::BinlogEncode(BinlogType::TypeFirst,
+                                             exec_time,
+                                             std::stoi(server_id),
+                                             logic_id,
+                                             filenum,
+                                             offset,
+                                             content,
+                                             {});
 }
 
 void PexpireCmd::DoInitial(PikaCmdArgsType &argv, const CmdInfo* const ptr_info) {
@@ -832,42 +944,50 @@ void PexpireCmd::DoInitial(PikaCmdArgsType &argv, const CmdInfo* const ptr_info)
 }
 
 void PexpireCmd::Do() {
-  int64_t res = 0;
-  nemo::Status s = g_pika_server->db()->Expire(key_, msec_/1000, &res);
-  if (s.ok() || s.IsNotFound()) {
+  std::map<blackwidow::DataType, rocksdb::Status> type_status;
+  int64_t res = g_pika_server->db()->Expire(key_, msec_/1000, &type_status);
+  if (res != -1) {
     res_.AppendInteger(res);
   } else {
-    res_.SetRes(CmdRes::kErrOther, s.ToString());
+    res_.SetRes(CmdRes::kErrOther, "expire internal error");
   }
   return;
 }
 
 std::string PexpireCmd::ToBinlog(
-    const PikaCmdArgsType& argv,
-    const std::string& server_id,
-    const std::string& binlog_info,
-    bool need_send_to_hub) {
-  std::string res;
-  res.reserve(RAW_ARGS_LEN);
-  RedisAppendLen(res, argv.size() + 4, "*");
+      const PikaCmdArgsType& argv,
+      uint32_t exec_time,
+      const std::string& server_id,
+      uint64_t logic_id,
+      uint32_t filenum,
+      uint64_t offset) {
+  std::string content;
+  content.reserve(RAW_ARGS_LEN);
+  RedisAppendLen(content, argv.size(), "*");
 
   // to expireat cmd
   std::string expireat_cmd("expireat");
-  RedisAppendLen(res, expireat_cmd.size(), "$");
-  RedisAppendContent(res, expireat_cmd);
+  RedisAppendLen(content, expireat_cmd.size(), "$");
+  RedisAppendContent(content, expireat_cmd);
   // key
-  RedisAppendLen(res, key_.size(), "$");
-  RedisAppendContent(res, key_);
+  RedisAppendLen(content, key_.size(), "$");
+  RedisAppendContent(content, key_);
   // sec
   char buf[100];
   int64_t expireat = time(nullptr) + msec_ / 1000;
   slash::ll2string(buf, 100, expireat);
   std::string at(buf);
-  RedisAppendLen(res, at.size(), "$");
-  RedisAppendContent(res, at);
+  RedisAppendLen(content, at.size(), "$");
+  RedisAppendContent(content, at);
 
-  AppendAffiliatedInfo(res, server_id, binlog_info, need_send_to_hub);
-  return res;
+  return PikaBinlogTransverter::BinlogEncode(BinlogType::TypeFirst,
+                                             exec_time,
+                                             std::stoi(server_id),
+                                             logic_id,
+                                             filenum,
+                                             offset,
+                                             content,
+                                             {});
 }
 
 void ExpireatCmd::DoInitial(PikaCmdArgsType &argv, const CmdInfo* const ptr_info) {
@@ -884,12 +1004,12 @@ void ExpireatCmd::DoInitial(PikaCmdArgsType &argv, const CmdInfo* const ptr_info
 }
 
 void ExpireatCmd::Do() {
-  int64_t res = 0;
-  nemo::Status s = g_pika_server->db()->Expireat(key_, time_stamp_, &res);
-  if (s.ok() || s.IsNotFound()) {
+  std::map<blackwidow::DataType, rocksdb::Status> type_status;
+  int32_t res = g_pika_server->db()->Expireat(key_, time_stamp_, &type_status);
+  if (res != -1) {
     res_.AppendInteger(res);
   } else {
-    res_.SetRes(CmdRes::kErrOther, s.ToString());
+    res_.SetRes(CmdRes::kErrOther, "expireat internal error");
   }
 }
 
@@ -907,41 +1027,50 @@ void PexpireatCmd::DoInitial(PikaCmdArgsType &argv, const CmdInfo* const ptr_inf
 }
 
 std::string PexpireatCmd::ToBinlog(
-    const PikaCmdArgsType& argv,
-    const std::string& server_id,
-    const std::string& binlog_info,
-    bool need_send_to_hub) {
-  std::string res;
-  res.reserve(RAW_ARGS_LEN);
-  RedisAppendLen(res, argv.size() + 4, "*");
+      const PikaCmdArgsType& argv,
+      uint32_t exec_time,
+      const std::string& server_id,
+      uint64_t logic_id,
+      uint32_t filenum,
+      uint64_t offset) {
+  std::string content;
+  content.reserve(RAW_ARGS_LEN);
+  RedisAppendLen(content, argv.size(), "*");
 
   // to expireat cmd
   std::string expireat_cmd("expireat");
-  RedisAppendLen(res, expireat_cmd.size(), "$");
-  RedisAppendContent(res, expireat_cmd);
+  RedisAppendLen(content, expireat_cmd.size(), "$");
+  RedisAppendContent(content, expireat_cmd);
   // key
-  RedisAppendLen(res, key_.size(), "$");
-  RedisAppendContent(res, key_);
+  RedisAppendLen(content, key_.size(), "$");
+  RedisAppendContent(content, key_);
   // sec
   char buf[100];
   int64_t expireat = time_stamp_ms_ / 1000;
   slash::ll2string(buf, 100, expireat);
   std::string at(buf);
-  RedisAppendLen(res, at.size(), "$");
-  RedisAppendContent(res, at);
+  RedisAppendLen(content, at.size(), "$");
+  RedisAppendContent(content, at);
 
-  AppendAffiliatedInfo(res, server_id, binlog_info, need_send_to_hub);
-  return res;
+  return PikaBinlogTransverter::BinlogEncode(BinlogType::TypeFirst,
+                                             exec_time,
+                                             std::stoi(server_id),
+                                             logic_id,
+                                             filenum,
+                                             offset,
+                                             content,
+                                             {});
 }
 
 void PexpireatCmd::Do() {
-  int64_t res = 0;
-  nemo::Status s = g_pika_server->db()->Expireat(key_, time_stamp_ms_/1000, &res);
-  if (s.ok() || s.IsNotFound()) {
+  std::map<blackwidow::DataType, rocksdb::Status> type_status;
+  int32_t res = g_pika_server->db()->Expireat(key_, time_stamp_ms_/1000, &type_status);
+  if (res != -1) {
     res_.AppendInteger(res);
   } else {
-    res_.SetRes(CmdRes::kErrOther, s.ToString());
+    res_.SetRes(CmdRes::kErrOther, "pexpireat internal error");
   }
+  return;
 }
 
 void TtlCmd::DoInitial(PikaCmdArgsType &argv, const CmdInfo* const ptr_info) {
@@ -954,12 +1083,29 @@ void TtlCmd::DoInitial(PikaCmdArgsType &argv, const CmdInfo* const ptr_info) {
 }
 
 void TtlCmd::Do() {
-  int64_t ttl = 0;
-  nemo::Status s = g_pika_server->db()->TTL(key_, &ttl);
-  if (s.ok() || s.IsNotFound()) {
-    res_.AppendInteger(ttl);
+  std::map<blackwidow::DataType, int64_t> type_timestamp;
+  std::map<blackwidow::DataType, rocksdb::Status> type_status;
+  type_timestamp = g_pika_server->db()->TTL(key_, &type_status);
+  for (const auto& item : type_timestamp) {
+     // mean operation exception errors happen in database
+     if (item.second == -3) {
+       res_.SetRes(CmdRes::kErrOther, "ttl internal error");
+       return;
+     }
+  }
+  if (type_timestamp[blackwidow::kStrings] != -2) {
+    res_.AppendInteger(type_timestamp[blackwidow::kStrings]);
+  } else if (type_timestamp[blackwidow::kHashes] != -2) {
+    res_.AppendInteger(type_timestamp[blackwidow::kHashes]);
+  } else if (type_timestamp[blackwidow::kLists] != -2) {
+    res_.AppendInteger(type_timestamp[blackwidow::kLists]);
+  } else if (type_timestamp[blackwidow::kSets] != -2) {
+    res_.AppendInteger(type_timestamp[blackwidow::kSets]);
+  } else if (type_timestamp[blackwidow::kZSets] != -2) {
+    res_.AppendInteger(type_timestamp[blackwidow::kZSets]);
   } else {
-    res_.SetRes(CmdRes::kErrOther, s.ToString());
+    // mean this key not exist
+    res_.AppendInteger(-2);
   }
   return;
 }
@@ -974,15 +1120,49 @@ void PttlCmd::DoInitial(PikaCmdArgsType &argv, const CmdInfo* const ptr_info) {
 }
 
 void PttlCmd::Do() {
-  int64_t ttl = 0;
-  nemo::Status s = g_pika_server->db()->TTL(key_, &ttl);
-  if (ttl > 0) {
-    ttl *= 1000;
+  std::map<blackwidow::DataType, int64_t> type_timestamp;
+  std::map<blackwidow::DataType, rocksdb::Status> type_status;
+  type_timestamp = g_pika_server->db()->TTL(key_, &type_status);
+  for (const auto& item : type_timestamp) {
+     // mean operation exception errors happen in database
+     if (item.second == -3) {
+       res_.SetRes(CmdRes::kErrOther, "ttl internal error");
+       return;
+     }
   }
-  if (s.ok() || s.IsNotFound()) {
-    res_.AppendInteger(ttl);
+  if (type_timestamp[blackwidow::kStrings] != -2) {
+    if (type_timestamp[blackwidow::kStrings] == -1) {
+      res_.AppendInteger(-1);
+    } else {
+      res_.AppendInteger(type_timestamp[blackwidow::kStrings] * 1000);
+    }
+  } else if (type_timestamp[blackwidow::kHashes] != -2) {
+    if (type_timestamp[blackwidow::kHashes] == -1) {
+      res_.AppendInteger(-1);
+    } else {
+      res_.AppendInteger(type_timestamp[blackwidow::kHashes] * 1000);
+    }
+  } else if (type_timestamp[blackwidow::kLists] != -2) {
+    if (type_timestamp[blackwidow::kLists] == -1) {
+      res_.AppendInteger(-1);
+    } else {
+      res_.AppendInteger(type_timestamp[blackwidow::kLists] * 1000);
+    }
+  } else if (type_timestamp[blackwidow::kSets] != -2) {
+    if (type_timestamp[blackwidow::kSets] == -1) {
+      res_.AppendInteger(-1);
+    } else {
+      res_.AppendInteger(type_timestamp[blackwidow::kSets] * 1000);
+    }
+  } else if (type_timestamp[blackwidow::kZSets] != -2) {
+    if (type_timestamp[blackwidow::kZSets] == -1) {
+      res_.AppendInteger(-1);
+    } else {
+      res_.AppendInteger(type_timestamp[blackwidow::kZSets] * 1000);
+    }
   } else {
-    res_.SetRes(CmdRes::kErrOther, s.ToString());
+    // mean this key not exist
+    res_.AppendInteger(-2);
   }
   return;
 }
@@ -997,12 +1177,12 @@ void PersistCmd::DoInitial(PikaCmdArgsType &argv, const CmdInfo* const ptr_info)
 }
 
 void PersistCmd::Do() {
-  int64_t res = 0;
-  nemo::Status s = g_pika_server->db()->Persist(key_, &res);
-  if (s.ok() || s.IsNotFound()) {
+  std::map<blackwidow::DataType, rocksdb::Status> type_status;
+  int32_t res = g_pika_server->db()->Persist(key_, &type_status);
+  if (res != -1) {
     res_.AppendInteger(res);
   } else {
-    res_.SetRes(CmdRes::kErrOther, s.ToString());
+    res_.SetRes(CmdRes::kErrOther, "persist internal error");
   }
   return;
 }
@@ -1018,7 +1198,7 @@ void TypeCmd::DoInitial(PikaCmdArgsType &argv, const CmdInfo* const ptr_info) {
 
 void TypeCmd::Do() {
   std::string res;
-  nemo::Status s = g_pika_server->db()->Type(key_, &res);
+  rocksdb::Status s = g_pika_server->db()->Type(key_, &res);
   if (s.ok()) {
     res_.AppendContent("+" + res);
   } else {
@@ -1063,8 +1243,7 @@ void ScanCmd::DoInitial(PikaCmdArgsType &argv, const CmdInfo* const ptr_info) {
 
 void ScanCmd::Do() {
   std::vector<std::string> keys;
-  int64_t cursor_ret = 0;
-  nemo::Status s = g_pika_server->db()->Scan(cursor_, pattern_, count_, keys, &cursor_ret);
+  int64_t cursor_ret = g_pika_server->db()->Scan(cursor_, pattern_, count_, &keys);
   
   res_.AppendArrayLen(2);
 
@@ -1078,6 +1257,232 @@ void ScanCmd::Do() {
   for (iter = keys.begin(); iter != keys.end(); iter++) {
     res_.AppendStringLen(iter->size());
     res_.AppendContent(*iter);
+  }
+  return;
+}
+
+void ScanxCmd::DoInitial(PikaCmdArgsType &argv, const CmdInfo* const ptr_info) {
+  if (!ptr_info->CheckArg(argv.size())) {
+    res_.SetRes(CmdRes::kWrongNum, kCmdNameScanx);
+    return;
+  }
+  if (!strcasecmp(argv[1].data(), "string")) {
+    type_ = blackwidow::kStrings;
+  } else if (!strcasecmp(argv[1].data(), "hash")) {
+    type_ = blackwidow::kHashes;
+  } else if (!strcasecmp(argv[1].data(), "set")) {
+    type_ = blackwidow::kSets;
+  } else if (!strcasecmp(argv[1].data(), "zset")) {
+    type_ = blackwidow::kZSets;
+  } else if (!strcasecmp(argv[1].data(), "list")) {
+    type_ = blackwidow::kLists;
+  } else {
+    res_.SetRes(CmdRes::kInvalidDbType);
+    return;
+  }
+
+  start_key_ = argv[2];
+  size_t index = 3, argc = argv.size();
+  while (index < argc) {
+    std::string opt = slash::StringToLower(argv[index]);
+    if (opt == "match" || opt == "count") {
+      index++;
+      if (index >= argc) {
+        res_.SetRes(CmdRes::kSyntaxErr);
+        return;
+      }
+      if (opt == "match") {
+        pattern_ = argv[index];
+      } else if (!slash::string2l(argv[index].data(), argv[index].size(), &count_) || count_ <= 0) {
+        res_.SetRes(CmdRes::kInvalidInt);
+        return;
+      }
+    } else {
+      res_.SetRes(CmdRes::kSyntaxErr);
+      return;
+    }
+    index++;
+  }
+  return;
+}
+
+void ScanxCmd::Do() {
+  std::string next_key;
+  std::vector<std::string> keys;
+  rocksdb::Status s = g_pika_server->db()->Scanx(type_, start_key_, pattern_, count_, &keys, &next_key);
+
+  if (s.ok()) {
+    res_.AppendArrayLen(2);
+    res_.AppendStringLen(next_key.size());
+    res_.AppendContent(next_key);
+
+    res_.AppendArrayLen(keys.size());
+    std::vector<std::string>::const_iterator iter;
+    for (const auto& key : keys){
+      res_.AppendString(key);
+    }
+  } else {
+    res_.SetRes(CmdRes::kErrOther, s.ToString());
+  }
+  return;
+}
+
+void PKScanRangeCmd::DoInitial(PikaCmdArgsType &argv, const CmdInfo* const ptr_info) {
+  if (!ptr_info->CheckArg(argv.size())) {
+    res_.SetRes(CmdRes::kWrongNum, kCmdNamePKScanRange);
+    return;
+  }
+  if (!strcasecmp(argv[1].data(), "string_with_value")) {
+    type_ = blackwidow::kStrings;
+    string_with_value = true;
+  } else if (!strcasecmp(argv[1].data(), "string")) {
+    type_ = blackwidow::kStrings;
+  } else if (!strcasecmp(argv[1].data(), "hash")) {
+    type_ = blackwidow::kHashes;
+  } else if (!strcasecmp(argv[1].data(), "set")) {
+    type_ = blackwidow::kSets;
+  } else if (!strcasecmp(argv[1].data(), "zset")) {
+    type_ = blackwidow::kZSets;
+  } else if (!strcasecmp(argv[1].data(), "list")) {
+    type_ = blackwidow::kLists;
+  } else {
+    res_.SetRes(CmdRes::kInvalidDbType);
+    return;
+  }
+
+  key_start_ = argv[2];
+  key_end_ = argv[3];
+  size_t index = 4, argc = argv.size();
+  while (index < argc) {
+    std::string opt = slash::StringToLower(argv[index]);
+    if (opt == "match" || opt == "limit") {
+      index++;
+      if (index >= argc) {
+        res_.SetRes(CmdRes::kSyntaxErr);
+        return;
+      }
+      if (opt == "match") {
+        pattern_ = argv[index];
+      } else if (!slash::string2l(argv[index].data(), argv[index].size(), &limit_) || limit_ <= 0) {
+        res_.SetRes(CmdRes::kInvalidInt);
+        return;
+      }
+    } else {
+      res_.SetRes(CmdRes::kSyntaxErr);
+      return;
+    }
+    index++;
+  }
+  return;
+}
+
+void PKScanRangeCmd::Do() {
+  std::string next_key;
+  std::vector<std::string> keys;
+  std::vector<blackwidow::KeyValue> kvs;
+  rocksdb::Status s = g_pika_server->db()->PKScanRange(type_, key_start_, key_end_, pattern_, limit_, &keys, &kvs, &next_key);
+
+  if (s.ok()) {
+    res_.AppendArrayLen(2);
+    res_.AppendStringLen(next_key.size());
+    res_.AppendContent(next_key);
+
+    if (type_ == blackwidow::kStrings) {
+      res_.AppendArrayLen(string_with_value ? 2 * kvs.size() : kvs.size());
+      for (const auto& kv : kvs) {
+        res_.AppendString(kv.key);
+        if (string_with_value) {
+          res_.AppendString(kv.value);
+        }
+      }
+    } else {
+      res_.AppendArrayLen(keys.size());
+      for (const auto& key : keys){
+        res_.AppendString(key);
+      }
+    }
+  } else {
+    res_.SetRes(CmdRes::kErrOther, s.ToString());
+  }
+  return;
+}
+
+void PKRScanRangeCmd::DoInitial(PikaCmdArgsType &argv, const CmdInfo* const ptr_info) {
+  if (!ptr_info->CheckArg(argv.size())) {
+    res_.SetRes(CmdRes::kWrongNum, kCmdNamePKRScanRange);
+    return;
+  }
+  if (!strcasecmp(argv[1].data(), "string_with_value")) {
+    type_ = blackwidow::kStrings;
+    string_with_value = true;
+  } else if (!strcasecmp(argv[1].data(), "string")) {
+    type_ = blackwidow::kStrings;
+  } else if (!strcasecmp(argv[1].data(), "hash")) {
+    type_ = blackwidow::kHashes;
+  } else if (!strcasecmp(argv[1].data(), "set")) {
+    type_ = blackwidow::kSets;
+  } else if (!strcasecmp(argv[1].data(), "zset")) {
+    type_ = blackwidow::kZSets;
+  } else if (!strcasecmp(argv[1].data(), "list")) {
+    type_ = blackwidow::kLists;
+  } else {
+    res_.SetRes(CmdRes::kInvalidDbType);
+    return;
+  }
+
+  key_start_ = argv[2];
+  key_end_ = argv[3];
+  size_t index = 4, argc = argv.size();
+  while (index < argc) {
+    std::string opt = slash::StringToLower(argv[index]);
+    if (opt == "match" || opt == "limit") {
+      index++;
+      if (index >= argc) {
+        res_.SetRes(CmdRes::kSyntaxErr);
+        return;
+      }
+      if (opt == "match") {
+        pattern_ = argv[index];
+      } else if (!slash::string2l(argv[index].data(), argv[index].size(), &limit_) || limit_ <= 0) {
+        res_.SetRes(CmdRes::kInvalidInt);
+        return;
+      }
+    } else {
+      res_.SetRes(CmdRes::kSyntaxErr);
+      return;
+    }
+    index++;
+  }
+  return;
+}
+
+void PKRScanRangeCmd::Do() {
+  std::string next_key;
+  std::vector<std::string> keys;
+  std::vector<blackwidow::KeyValue> kvs;
+  rocksdb::Status s = g_pika_server->db()->PKRScanRange(type_, key_start_, key_end_, pattern_, limit_, &keys, &kvs, &next_key);
+
+  if (s.ok()) {
+    res_.AppendArrayLen(2);
+    res_.AppendStringLen(next_key.size());
+    res_.AppendContent(next_key);
+
+    if (type_ == blackwidow::kStrings) {
+      res_.AppendArrayLen(string_with_value ? 2 * kvs.size() : kvs.size());
+      for (const auto& kv : kvs) {
+        res_.AppendString(kv.key);
+        if (string_with_value) {
+          res_.AppendString(kv.value);
+        }
+      }
+    } else {
+      res_.AppendArrayLen(keys.size());
+      for (const auto& key : keys){
+        res_.AppendString(key);
+      }
+    }
+  } else {
+    res_.SetRes(CmdRes::kErrOther, s.ToString());
   }
   return;
 }

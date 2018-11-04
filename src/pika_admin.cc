@@ -9,7 +9,6 @@
 #include "include/pika_conf.h"
 #include "include/pika_admin.h"
 #include "include/pika_server.h"
-#include "include/pika_slot.h"
 #include "include/build_version.h"
 #include "include/pika_version.h"
 
@@ -90,7 +89,7 @@ void SlaveofCmd::Do() {
     }
 
     // Stop rsync
-    LOG(INFO) << "start slaveof, stop rsync first";
+    LOG(INFO) << "Start slaveof, stop rsync first";
     slash::StopRsync(g_pika_conf->db_sync_path());
     g_pika_server->RemoveMaster();
 
@@ -105,6 +104,22 @@ void SlaveofCmd::Do() {
         g_pika_server->PurgeLogs(filenum_ - 1, true, true);
       }
       g_pika_server->logger_->SetProducerStatus(filenum_, pro_offset_);
+    }
+  } else {
+    if (is_noone_) {
+      // Stop rsync
+      LOG(INFO) << "Slaveof no one in double-master mode";
+      slash::StopRsync(g_pika_conf->db_sync_path());
+
+      g_pika_server->RemoveMaster();
+
+      std::string double_master_ip = g_pika_conf->double_master_ip();
+      if (double_master_ip == "127.0.0.1") {
+        double_master_ip = g_pika_server->host();
+      }
+      g_pika_server->DeleteSlave(double_master_ip, g_pika_conf->double_master_port());
+      res_.SetRes(CmdRes::kOk);
+      return;
     }
   }
 
@@ -163,7 +178,8 @@ void TrysyncCmd::Do() {
   int64_t sid = g_pika_server->TryAddSlave(slave_ip_, slave_port_);
   if (sid >= 0) {
     Status status = g_pika_server->AddBinlogSender(slave_ip_, slave_port_,
-        filenum_, pro_offset_);
+                                                   sid,
+                                                   filenum_, pro_offset_);
     if (status.ok()) {
       res_.AppendInteger(sid);
       LOG(INFO) << "Send Sid to Slave: " << sid;
@@ -191,61 +207,6 @@ void TrysyncCmd::Do() {
     LOG(WARNING) << "slave already exist, slave ip: " << slave_ip_
       << "slave port: " << slave_port_;
     res_.SetRes(CmdRes::kErrOther, "AlreadyExist");
-  }
-}
-
-void InternalTrysyncCmd::DoInitial(PikaCmdArgsType &argv,
-                                   const CmdInfo* const ptr_info) {
-  if (!ptr_info->CheckArg(argv.size())) {
-    res_.SetRes(CmdRes::kWrongNum, kCmdNameTrysync);
-    return;
-  }
-  PikaCmdArgsType::iterator it = argv.begin() + 1; //Remember the first args is the opt name
-  hub_ip_ = *it++;
-
-  std::string str_hub_port = *it++;
-  if (!slash::string2l(str_hub_port.data(), str_hub_port.size(), &hub_port_) ||
-      hub_port_ <= 0) {
-    res_.SetRes(CmdRes::kInvalidInt);
-    return;
-  }
-
-  std::string str_filenum = *it++;
-  if (!slash::string2l(str_filenum.data(), str_filenum.size(), &filenum_) ||
-      filenum_ < 0) {
-    res_.SetRes(CmdRes::kInvalidInt);
-    return;
-  }
-
-  std::string str_pro_offset = *it++;
-  if (!slash::string2l(str_pro_offset.data(), str_pro_offset.size(), &pro_offset_) ||
-      pro_offset_ < 0) {
-    res_.SetRes(CmdRes::kInvalidInt);
-    return;
-  }
-
-  send_most_recently_ = (*it == "1");
-}
-
-void InternalTrysyncCmd::Do() {
-  LOG(INFO) << "InternalTrysync, Hub ip: " << hub_ip_ << "Hub port:" << hub_port_
-    << " filenum: " << filenum_ << " pro_offset: " << pro_offset_;
-
-  Status status = g_pika_server->pika_hub_manager_->AddHub(
-      hub_ip_, hub_port_ + 1000,
-      filenum_, pro_offset_,
-      send_most_recently_);
-
-  if (!status.ok()) {
-    LOG(WARNING) << "hub offset is larger than mine, slave ip: " << hub_ip_
-      << "slave port:" << hub_port_
-      << " filenum: " << filenum_ << " pro_offset_: " << pro_offset_ << " "
-      << status.ToString();
-    // treat errors as InvalidOffset
-    res_.SetRes(CmdRes::kErrOther, "InvalidOffset");
-  } else {
-    res_.SetRes(CmdRes::kOk);
-    LOG(INFO) << "Send OK to Hub";
   }
 }
 
@@ -319,19 +280,19 @@ void CompactCmd::DoInitial(PikaCmdArgsType &argv, const CmdInfo* const ptr_info)
 }
 
 void CompactCmd::Do() {
-  nemo::Status s;
+  rocksdb::Status s;
   if (struct_type_.empty()) {
-    s = g_pika_server->db()->Compact(nemo::kALL);
+    s = g_pika_server->db()->Compact(blackwidow::kAll);
   } else if (struct_type_ == "string") {
-    s = g_pika_server->db()->Compact(nemo::kKV_DB);
+    s = g_pika_server->db()->Compact(blackwidow::kStrings);
   } else if (struct_type_ == "hash") {
-    s = g_pika_server->db()->Compact(nemo::kHASH_DB);
+    s = g_pika_server->db()->Compact(blackwidow::kHashes);
   } else if (struct_type_ == "set") {
-    s = g_pika_server->db()->Compact(nemo::kSET_DB);
+    s = g_pika_server->db()->Compact(blackwidow::kSets);
   } else if (struct_type_ == "zset") {
-    s = g_pika_server->db()->Compact(nemo::kZSET_DB);
+    s = g_pika_server->db()->Compact(blackwidow::kZSets);
   } else if (struct_type_ == "list") {
-    s = g_pika_server->db()->Compact(nemo::kLIST_DB);
+    s = g_pika_server->db()->Compact(blackwidow::kLists);
   } else {
     res_.SetRes(CmdRes::kInvalidDbType);
     return;
@@ -419,15 +380,15 @@ void FlushdbCmd::DoInitial(PikaCmdArgsType &argv, const CmdInfo* const ptr_info)
   }
   std::string struct_type = slash::StringToLower(argv[1]);
   if (struct_type == "string") {
-    db_name_ = "kv";
+    db_name_ = "strings";
   } else if (struct_type == "hash") {
-    db_name_ = "hash";
+    db_name_ = "hashes";
   } else if (struct_type == "set") {
-    db_name_ = "set";
+    db_name_ = "sets";
   } else if (struct_type == "zset") {
-    db_name_ = "zset";
+    db_name_ = "zsets";
   } else if (struct_type == "list") {
-    db_name_ = "list";
+    db_name_ = "lists";
   } else {
     res_.SetRes(CmdRes::kInvalidDbType);
   }
@@ -528,11 +489,12 @@ void ShutdownCmd::Do() {
   res_.SetRes(CmdRes::kNone);
 }
 
+const std::string InfoCmd::kInfoSection = "info";
 const std::string InfoCmd::kAllSection = "all";
 const std::string InfoCmd::kServerSection = "server";
 const std::string InfoCmd::kClientsSection = "clients";
-const std::string InfoCmd::kHubSection = "hub";
 const std::string InfoCmd::kStatsSection = "stats";
+const std::string InfoCmd::kExecCountSection= "command_exec_count";
 const std::string InfoCmd::kCPUSection = "cpu";
 const std::string InfoCmd::kReplicationSection = "replication";
 const std::string InfoCmd::kKeyspaceSection = "keyspace";
@@ -548,7 +510,7 @@ void InfoCmd::DoInitial(PikaCmdArgsType &argv, const CmdInfo* const ptr_info) {
     return;
   }
   if (argc == 1) {
-    info_section_ = kInfoAll;
+    info_section_ = kInfo;
     return;
   } //then the agc is 2 or 3
   slash::StringToLower(argv[1]);
@@ -558,10 +520,10 @@ void InfoCmd::DoInitial(PikaCmdArgsType &argv, const CmdInfo* const ptr_info) {
     info_section_ = kInfoServer;
   } else if (argv[1] == kClientsSection) {
     info_section_ = kInfoClients;
-  } else if (argv[1] == kHubSection) {
-    info_section_ = kInfoHub;
   } else if (argv[1] == kStatsSection) {
     info_section_ = kInfoStats;
+  } else if (argv[1] == kExecCountSection) {
+    info_section_ = kInfoExecCount;
   } else if (argv[1] == kCPUSection) {
     info_section_ = kInfoCPU;
   } else if (argv[1] == kReplicationSection) {
@@ -596,6 +558,27 @@ void InfoCmd::DoInitial(PikaCmdArgsType &argv, const CmdInfo* const ptr_info) {
 void InfoCmd::Do() {
   std::string info;
   switch (info_section_) {
+    case kInfo:
+      InfoServer(info);
+      info.append("\r\n");
+      InfoData(info);
+      info.append("\r\n");
+      InfoLog(info);
+      info.append("\r\n");
+      InfoClients(info);
+      info.append("\r\n");
+      InfoStats(info);
+      info.append("\r\n");
+      InfoCPU(info);
+      info.append("\r\n");
+      InfoReplication(info);
+      info.append("\r\n");
+      InfoKeyspace(info);
+      if (g_pika_server->DoubleMasterMode()) {
+        info.append("\r\n");
+        InfoDoubleMaster(info);
+      }
+      break;
     case kInfoAll:
       InfoServer(info);
       info.append("\r\n");
@@ -605,17 +588,19 @@ void InfoCmd::Do() {
       info.append("\r\n");
       InfoClients(info);
       info.append("\r\n");
-      InfoHub(info);
-      info.append("\r\n");
       InfoStats(info);
+      info.append("\r\n");
+      InfoExecCount(info);
       info.append("\r\n");
       InfoCPU(info);
       info.append("\r\n");
       InfoReplication(info);
       info.append("\r\n");
       InfoKeyspace(info);
-      info.append("\r\n");
-      InfoDoubleMaster(info);
+      if (g_pika_server->DoubleMasterMode()) {
+        info.append("\r\n");
+        InfoDoubleMaster(info);
+      }
       break;
     case kInfoServer:
       InfoServer(info);
@@ -623,11 +608,11 @@ void InfoCmd::Do() {
     case kInfoClients:
       InfoClients(info);
       break;
-    case kInfoHub:
-      InfoHub(info);
-      break;
     case kInfoStats:
       InfoStats(info);
+      break;
+    case kInfoExecCount:
+      InfoExecCount(info);
       break;
     case kInfoCPU:
       InfoCPU(info);
@@ -702,14 +687,6 @@ void InfoCmd::InfoClients(std::string &info) {
   info.append(tmp_stream.str());
 }
 
-void InfoCmd::InfoHub(std::string &info) {
-  std::stringstream tmp_stream;
-  tmp_stream << "# Hub\r\n";
-  tmp_stream << g_pika_server->pika_hub_manager_->StatusToString() << "\r\n";
-
-  info.append(tmp_stream.str());
-}
-
 void InfoCmd::InfoStats(std::string &info) {
   std::stringstream tmp_stream;
   tmp_stream << "# Stats\r\n";
@@ -722,14 +699,6 @@ void InfoCmd::InfoStats(std::string &info) {
   time_t current_time_s = time(NULL);
   tmp_stream << "is_bgsaving:" << (is_bgsaving ? "Yes, " : "No, ") << bgsave_info.s_start_time << ", "
                                 << (is_bgsaving ? (current_time_s - bgsave_info.start_time) : 0) << "\r\n";
-  PikaServer::BGSlotsReload bgslotsreload_info = g_pika_server->bgslots_reload();
-  bool is_reloading = g_pika_server->GetSlotsreloading();
-  tmp_stream << "is_slots_reloading:" << (is_reloading ? "Yes, " : "No, ") << bgslotsreload_info.s_start_time << ", "
-                                << (is_reloading ? (current_time_s - bgslotsreload_info.start_time) : 0) << "\r\n";
-  PikaServer::BGSlotsCleanup bgslotscleanup_info = g_pika_server->bgslots_cleanup();
-  bool is_cleanuping = g_pika_server->GetSlotscleanuping();
-  tmp_stream << "is_slots_cleanuping:" << (is_cleanuping ? "Yes, " : "No, ") << bgslotscleanup_info.s_start_time << ", "
-                                << (is_cleanuping ? (current_time_s - bgslotscleanup_info.start_time) : 0) << "\r\n";
   PikaServer::KeyScanInfo key_scan_info = g_pika_server->key_scan_info();
   bool is_scaning = g_pika_server->key_scaning();
   tmp_stream << "is_scaning_keyspace:" << (is_scaning ? ("Yes, " + key_scan_info.s_start_time) + "," : "No");
@@ -741,6 +710,17 @@ void InfoCmd::InfoStats(std::string &info) {
   tmp_stream << "compact_cron:" << g_pika_conf->compact_cron() << "\r\n";
   tmp_stream << "compact_interval:" << g_pika_conf->compact_interval() << "\r\n";
 
+  info.append(tmp_stream.str());
+}
+
+void InfoCmd::InfoExecCount(std::string &info) {
+  std::stringstream tmp_stream;
+  tmp_stream << "# Command_Exec_Count\r\n";
+
+  std::unordered_map<std::string, uint64_t> command_exec_count_table = g_pika_server->ServerExecCountTable();
+  for (const auto& item : command_exec_count_table) {
+    tmp_stream << item.first << ":" << item.second << "\r\n";
+  }
   info.append(tmp_stream.str());
 }
 
@@ -787,7 +767,6 @@ void InfoCmd::InfoReplication(std::string &info) {
   }
 
   std::string slaves_list_str;
-  //int32_t slaves_num = g_pika_server->GetSlaveListString(slaves_list_str);
   switch (host_role) {
     case PIKA_ROLE_SLAVE :
       tmp_stream << "master_host:" << g_pika_server->master_ip() << "\r\n";
@@ -795,14 +774,14 @@ void InfoCmd::InfoReplication(std::string &info) {
       tmp_stream << "master_link_status:" << (g_pika_server->repl_state() == PIKA_REPL_CONNECTED ? "up" : "down") << "\r\n";
       tmp_stream << "slave_priority:" << g_pika_conf->slave_priority() << "\r\n";
       tmp_stream << "slave_read_only:" << g_pika_conf->readonly() << "\r\n";
-      tmp_stream << "repl_state: " << (g_pika_server->repl_state()) << "\r\n";
+      tmp_stream << "repl_state: " << (g_pika_server->repl_state_str()) << "\r\n";
       break;
     case PIKA_ROLE_MASTER | PIKA_ROLE_SLAVE :
       tmp_stream << "master_host:" << g_pika_server->master_ip() << "\r\n";
       tmp_stream << "master_port:" << g_pika_server->master_port() << "\r\n";
       tmp_stream << "master_link_status:" << (g_pika_server->repl_state() == PIKA_REPL_CONNECTED ? "up" : "down") << "\r\n";
       tmp_stream << "slave_read_only:" << g_pika_conf->readonly() << "\r\n";
-      tmp_stream << "repl_state: " << (g_pika_server->repl_state()) << "\r\n";
+      tmp_stream << "repl_state: " << (g_pika_server->repl_state_str()) << "\r\n";
     case PIKA_ROLE_SINGLE :
     case PIKA_ROLE_MASTER :
       tmp_stream << "connected_slaves:" << g_pika_server->GetSlaveListString(slaves_list_str) << "\r\n" << slaves_list_str;
@@ -818,7 +797,7 @@ void InfoCmd::InfoDoubleMaster(std::string &info) {
   switch (host_role) {
     case PIKA_ROLE_SINGLE :
     case PIKA_ROLE_MASTER : tmp_stream << "MASTER)\r\nrole:master\r\n"; break;
-    case PIKA_ROLE_SLAVE : tmp_stream << "SLAVE)\r\nrole:slave\r\b"; break;
+    case PIKA_ROLE_SLAVE : tmp_stream << "SLAVE)\r\nrole:slave\r\n"; break;
     case PIKA_ROLE_DOUBLE_MASTER :
         if (g_pika_server->DoubleMasterMode()) {
           tmp_stream << "DOUBLEMASTER)\r\nrole:double_master\r\n"; break;
@@ -857,7 +836,7 @@ void InfoCmd::InfoKeyspace(std::string &info) {
   std::stringstream tmp_stream;
   tmp_stream << "# Keyspace\r\n";
   tmp_stream << "# Time:" << key_scan_info.s_start_time << "\r\n";
-  tmp_stream << "kv keys:" << key_nums_v[0] << "\r\n";
+  tmp_stream << "string keys:" << key_nums_v[0] << "\r\n";
   tmp_stream << "hash keys:" << key_nums_v[1] << "\r\n";
   tmp_stream << "list keys:" << key_nums_v[2] << "\r\n";
   tmp_stream << "zset keys:" << key_nums_v[3] << "\r\n";
@@ -900,9 +879,9 @@ void InfoCmd::InfoData(std::string &info) {
   tmp_stream << "compression:" << g_pika_conf->compression() << "\r\n";
 
   // rocksdb related memory usage
-  uint64_t memtable_usage, table_reader_usage;
-  g_pika_server->db()->GetUsage(nemo::USAGE_TYPE_ROCKSDB_MEMTABLE, &memtable_usage);
-  g_pika_server->db()->GetUsage(nemo::USAGE_TYPE_ROCKSDB_TABLE_READER, &table_reader_usage);
+  uint64_t memtable_usage = 0, table_reader_usage = 0;
+  g_pika_server->db()->GetUsage(blackwidow::USAGE_TYPE_ROCKSDB_MEMTABLE, &memtable_usage);
+  g_pika_server->db()->GetUsage(blackwidow::USAGE_TYPE_ROCKSDB_TABLE_READER, &table_reader_usage);
 
   tmp_stream << "used_memory:" << (memtable_usage + table_reader_usage) << "\r\n";
   tmp_stream << "used_memory_human:" << ((memtable_usage + table_reader_usage) >> 20) << "M\r\n";
@@ -967,180 +946,225 @@ void ConfigCmd::Do() {
 }
 
 static void EncodeString(std::string *dst, const std::string &value) {
-    dst->append("$");
-    dst->append(std::to_string(value.size()));
-    dst->append("\r\n");
-    dst->append(value.data(), value.size());
-    dst->append("\r\n");
+  dst->append("$");
+  dst->append(std::to_string(value.size()));
+  dst->append("\r\n");
+  dst->append(value.data(), value.size());
+  dst->append("\r\n");
 }
 
 static void EncodeInt32(std::string *dst, const int32_t v) {
-    std::string vstr = std::to_string(v);
-    dst->append("$");
-    dst->append(std::to_string(vstr.length()));
-    dst->append("\r\n");
-    dst->append(vstr);
-    dst->append("\r\n");
+  std::string vstr = std::to_string(v);
+  dst->append("$");
+  dst->append(std::to_string(vstr.length()));
+  dst->append("\r\n");
+  dst->append(vstr);
+  dst->append("\r\n");
+}
+
+static void EncodeInt64(std::string *dst, const int64_t v) {
+  std::string vstr = std::to_string(v);
+  dst->append("$");
+  dst->append(std::to_string(vstr.length()));
+  dst->append("\r\n");
+  dst->append(vstr);
+  dst->append("\r\n");
 }
 
 void ConfigCmd::ConfigGet(std::string &ret) {
   std::string get_item = config_args_v_[1];
   if (get_item == "port") {
-      ret = "*2\r\n";
-      EncodeString(&ret, "port");
-      EncodeInt32(&ret, g_pika_conf->port());
+    ret = "*2\r\n";
+    EncodeString(&ret, "port");
+    EncodeInt32(&ret, g_pika_conf->port());
   } else if (get_item == "double-master-ip") {
-      ret = "*2\r\n";
-      EncodeString(&ret, "double-master-ip");
-      EncodeString(&ret, g_pika_conf->double_master_ip());
+    ret = "*2\r\n";
+    EncodeString(&ret, "double-master-ip");
+    EncodeString(&ret, g_pika_conf->double_master_ip());
   } else if (get_item == "double-master-port") {
-      ret = "*2\r\n";
-      EncodeString(&ret, "double-master-port");
-      EncodeInt32(&ret, g_pika_conf->double_master_port());
+    ret = "*2\r\n";
+    EncodeString(&ret, "double-master-port");
+    EncodeInt32(&ret, g_pika_conf->double_master_port());
   } else if (get_item == "double-master-sid") {
-      ret = "*2\r\n";
-      EncodeString(&ret, "double-master-sid");
-      EncodeString(&ret, g_pika_conf->double_master_sid());
+    ret = "*2\r\n";
+    EncodeString(&ret, "double-master-sid");
+    EncodeString(&ret, g_pika_conf->double_master_sid());
   } else if (get_item == "thread-num") {
-      ret = "*2\r\n";
-      EncodeString(&ret, "thread-num");
-      EncodeInt32(&ret, g_pika_conf->thread_num());
+    ret = "*2\r\n";
+    EncodeString(&ret, "thread-num");
+    EncodeInt32(&ret, g_pika_conf->thread_num());
   } else if (get_item == "sync-thread-num") {
-      ret = "*2\r\n";
-      EncodeString(&ret, "sync-thread-num");
-      EncodeInt32(&ret, g_pika_conf->sync_thread_num());
+    ret = "*2\r\n";
+    EncodeString(&ret, "sync-thread-num");
+    EncodeInt32(&ret, g_pika_conf->sync_thread_num());
   } else if (get_item == "sync-buffer-size") {
-      ret = "*2\r\n";
-      EncodeString(&ret, "sync-buffer-size");
-      EncodeInt32(&ret, g_pika_conf->sync_buffer_size());
+    ret = "*2\r\n";
+    EncodeString(&ret, "sync-buffer-size");
+    EncodeInt32(&ret, g_pika_conf->sync_buffer_size());
   } else if (get_item == "log-path") {
-      ret = "*2\r\n";
-      EncodeString(&ret, "log-path");
-      EncodeString(&ret, g_pika_conf->log_path());
+    ret = "*2\r\n";
+    EncodeString(&ret, "log-path");
+    EncodeString(&ret, g_pika_conf->log_path());
   } else if (get_item == "loglevel") {
-      ret = "*2\r\n";
-      EncodeString(&ret, "loglevel");
-      EncodeString(&ret, g_pika_conf->log_level() ? "ERROR" : "INFO");
+    ret = "*2\r\n";
+    EncodeString(&ret, "loglevel");
+    EncodeString(&ret, g_pika_conf->log_level() ? "ERROR" : "INFO");
   } else if (get_item == "db-path") {
-      ret = "*2\r\n";
-      EncodeString(&ret, "db-path");
-      EncodeString(&ret, g_pika_conf->db_path());
+    ret = "*2\r\n";
+    EncodeString(&ret, "db-path");
+    EncodeString(&ret, g_pika_conf->db_path());
   } else if (get_item == "db-sync-path") {
-      ret = "*2\r\n";
-      EncodeString(&ret, "db-sync-path");
-      EncodeString(&ret, g_pika_conf->db_sync_path());
+    ret = "*2\r\n";
+    EncodeString(&ret, "db-sync-path");
+    EncodeString(&ret, g_pika_conf->db_sync_path());
   } else if (get_item == "db-sync-speed") {
-      ret = "*2\r\n";
-      EncodeString(&ret, "db-sync-speed");
-      EncodeInt32(&ret, g_pika_conf->db_sync_speed());
+    ret = "*2\r\n";
+    EncodeString(&ret, "db-sync-speed");
+    EncodeInt32(&ret, g_pika_conf->db_sync_speed());
   } else if (get_item == "compact-cron") {
-      ret = "*2\r\n";
-      EncodeString(&ret, "compact-cron");
-      EncodeString(&ret, g_pika_conf->compact_cron());
+    ret = "*2\r\n";
+    EncodeString(&ret, "compact-cron");
+    EncodeString(&ret, g_pika_conf->compact_cron());
   } else if (get_item == "compact-interval") {
-      ret = "*2\r\n";
-      EncodeString(&ret, "compact-interval");
-      EncodeString(&ret, g_pika_conf->compact_interval());
+    ret = "*2\r\n";
+    EncodeString(&ret, "compact-interval");
+    EncodeString(&ret, g_pika_conf->compact_interval());
   } else if (get_item == "maxmemory") {
-      ret = "*2\r\n";
-      EncodeString(&ret, "maxmemory");
-      EncodeInt32(&ret, g_pika_conf->write_buffer_size());
+    ret = "*2\r\n";
+    EncodeString(&ret, "maxmemory");
+    EncodeInt32(&ret, g_pika_conf->write_buffer_size());
   } else if (get_item == "write-buffer-size") {
-      ret = "*2\r\n";
-      EncodeString(&ret, "write-buffer-size");
-      EncodeInt32(&ret, g_pika_conf->write_buffer_size());
+    ret = "*2\r\n";
+    EncodeString(&ret, "write-buffer-size");
+    EncodeInt64(&ret, g_pika_conf->write_buffer_size());
   } else if (get_item == "timeout") {
-      ret = "*2\r\n";
-      EncodeString(&ret, "timeout");
-      EncodeInt32(&ret, g_pika_conf->timeout());
+    ret = "*2\r\n";
+    EncodeString(&ret, "timeout");
+    EncodeInt32(&ret, g_pika_conf->timeout());
   } else if (get_item == "requirepass") {
-      ret = "*2\r\n";
-      EncodeString(&ret, "requirepass");
-      EncodeString(&ret, g_pika_conf->requirepass());
+    ret = "*2\r\n";
+    EncodeString(&ret, "requirepass");
+    EncodeString(&ret, g_pika_conf->requirepass());
   }  else if (get_item == "masterauth") {
-      ret = "*2\r\n";
-      EncodeString(&ret, "masterauth");
-      EncodeString(&ret, g_pika_conf->masterauth());
+    ret = "*2\r\n";
+    EncodeString(&ret, "masterauth");
+    EncodeString(&ret, g_pika_conf->masterauth());
   } else if (get_item == "userpass") {
-      ret = "*2\r\n";
-      EncodeString(&ret, "userpass");
-      EncodeString(&ret, g_pika_conf->userpass());
+    ret = "*2\r\n";
+    EncodeString(&ret, "userpass");
+    EncodeString(&ret, g_pika_conf->userpass());
   } else if (get_item == "userblacklist") {
-      ret = "*2\r\n";
-      EncodeString(&ret, "userblacklist");
-      EncodeString(&ret, (g_pika_conf->suser_blacklist()).c_str());
+    ret = "*2\r\n";
+    EncodeString(&ret, "userblacklist");
+    EncodeString(&ret, (g_pika_conf->suser_blacklist()).c_str());
   } else if (get_item == "dump-prefix") {
-      ret = "*2\r\n";
-      EncodeString(&ret, "dump-prefix");
-      EncodeString(&ret, g_pika_conf->bgsave_prefix());
+    ret = "*2\r\n";
+    EncodeString(&ret, "dump-prefix");
+    EncodeString(&ret, g_pika_conf->bgsave_prefix());
   } else if (get_item == "daemonize") {
-      ret = "*2\r\n";
-      EncodeString(&ret, "daemonize");
-      EncodeString(&ret, g_pika_conf->daemonize() ? "yes" : "no");
-  } else if (get_item == "slotmigrate") {
-      ret = "*2\r\n";
-      EncodeString(&ret, "slotmigrate");
-      EncodeString(&ret, g_pika_conf->slotmigrate() ? "yes" : "no");
+    ret = "*2\r\n";
+    EncodeString(&ret, "daemonize");
+    EncodeString(&ret, g_pika_conf->daemonize() ? "yes" : "no");
   } else if (get_item == "dump-path") {
-      ret = "*2\r\n";
-      EncodeString(&ret, "dump-path");
-      EncodeString(&ret, g_pika_conf->bgsave_path());
+    ret = "*2\r\n";
+    EncodeString(&ret, "dump-path");
+    EncodeString(&ret, g_pika_conf->bgsave_path());
   } else if (get_item == "dump-expire") {
-      ret = "*2\r\n";
-      EncodeString(&ret, "dump-expire");
-      EncodeInt32(&ret, g_pika_conf->expire_dump_days());
+    ret = "*2\r\n";
+    EncodeString(&ret, "dump-expire");
+    EncodeInt32(&ret, g_pika_conf->expire_dump_days());
   } else if (get_item == "pidfile") {
-      ret = "*2\r\n";
-      EncodeString(&ret, "pidfile");
-      EncodeString(&ret, g_pika_conf->pidfile());
+    ret = "*2\r\n";
+    EncodeString(&ret, "pidfile");
+    EncodeString(&ret, g_pika_conf->pidfile());
   } else if (get_item == "maxclients") {
-      ret = "*2\r\n";
-      EncodeString(&ret, "maxclients");
-      EncodeInt32(&ret, g_pika_conf->maxclients());
+    ret = "*2\r\n";
+    EncodeString(&ret, "maxclients");
+    EncodeInt32(&ret, g_pika_conf->maxclients());
   } else if (get_item == "target-file-size-base") {
-      ret = "*2\r\n";
-      EncodeString(&ret, "target-file-size-base");
-      EncodeInt32(&ret, g_pika_conf->target_file_size_base());
+    ret = "*2\r\n";
+    EncodeString(&ret, "target-file-size-base");
+    EncodeInt32(&ret, g_pika_conf->target_file_size_base());
   } else if (get_item == "max-background-flushes") {
-      ret = "*2\r\n";
-      EncodeString(&ret, "max-background-flushes");
-      EncodeInt32(&ret, g_pika_conf->max_background_flushes());
+    ret = "*2\r\n";
+    EncodeString(&ret, "max-background-flushes");
+    EncodeInt32(&ret, g_pika_conf->max_background_flushes());
   } else if (get_item == "max-background-compactions") {
-      ret = "*2\r\n";
-      EncodeString(&ret, "max-background-compactions");
-      EncodeInt32(&ret, g_pika_conf->max_background_compactions());
+    ret = "*2\r\n";
+    EncodeString(&ret, "max-background-compactions");
+    EncodeInt32(&ret, g_pika_conf->max_background_compactions());
   } else if (get_item == "max-cache-files") {
-      ret = "*2\r\n";
-      EncodeString(&ret, "max-cache-files");
-      EncodeInt32(&ret, g_pika_conf->max_cache_files());
+    ret = "*2\r\n";
+    EncodeString(&ret, "max-cache-files");
+    EncodeInt32(&ret, g_pika_conf->max_cache_files());
   } else if (get_item == "max-bytes-for-level-multiplier") {
-      ret = "*2\r\n";
-      EncodeString(&ret, "max-bytes-for-level-multiplier");
-      EncodeInt32(&ret, g_pika_conf->max_bytes_for_level_multiplier());
+    ret = "*2\r\n";
+    EncodeString(&ret, "max-bytes-for-level-multiplier");
+    EncodeInt32(&ret, g_pika_conf->max_bytes_for_level_multiplier());
+  } else if (get_item == "block-size") {
+    ret = "*2\r\n";
+    EncodeString(&ret, "block-size");
+    EncodeInt64(&ret, g_pika_conf->block_size());
+  } else if (get_item == "block-cache") {
+    ret = "*2\r\n";
+    EncodeString(&ret, "block-cache");
+    EncodeInt64(&ret, g_pika_conf->block_cache());
+  } else if (get_item == "share-block-cache") {
+    ret = "*2\r\n";
+    EncodeString(&ret, "share-block-cache");
+    EncodeString(&ret, g_pika_conf->share_block_cache() ? "yes" : "no");
+  } else if (get_item == "cache-index-and-filter-blocks") {
+    ret = "*2\r\n";
+    EncodeString(&ret, "cache-index-and-filter-blocks");
+    EncodeString(&ret, g_pika_conf->cache_index_and_filter_blocks() ? "yes" : "no");
+  } else if (get_item == "optimize-filters-for-hits") {
+    ret = "*2\r\n";
+    EncodeString(&ret, "optimize-filters-for-hits");
+    EncodeString(&ret, g_pika_conf->optimize_filters_for_hits() ? "yes" : "no"); 
+  } else if (get_item == "level-compaction-dynamic-level-bytes") {
+    ret = "*2\r\n";
+    EncodeString(&ret, "level-compaction-dynamic-level-bytes");
+    EncodeString(&ret, g_pika_conf->level_compaction_dynamic_level_bytes() ? "yes" : "no");
   } else if (get_item == "expire-logs-days") {
-      ret = "*2\r\n";
-      EncodeString(&ret, "expire-logs-days");
-      EncodeInt32(&ret, g_pika_conf->expire_logs_days());
+    ret = "*2\r\n";
+    EncodeString(&ret, "expire-logs-days");
+    EncodeInt32(&ret, g_pika_conf->expire_logs_days());
   } else if (get_item == "expire-logs-nums") {
-      ret = "*2\r\n";
-      EncodeString(&ret, "expire-logs-nums");
-      EncodeInt32(&ret, g_pika_conf->expire_logs_nums());
+    ret = "*2\r\n";
+    EncodeString(&ret, "expire-logs-nums");
+    EncodeInt32(&ret, g_pika_conf->expire_logs_nums());
   } else if (get_item == "root-connection-num" ) {
-      ret = "*2\r\n";
-      EncodeString(&ret, "root-connection-num");
-      EncodeInt32(&ret, g_pika_conf->root_connection_num());
+    ret = "*2\r\n";
+    EncodeString(&ret, "root-connection-num");
+    EncodeInt32(&ret, g_pika_conf->root_connection_num());
+  } else if (get_item == "slowlog-write-errorlog") {
+    ret = "*2\r\n";
+    EncodeString(&ret, "slowlog-write-errorlog");
+    EncodeString(&ret, g_pika_conf->slowlog_write_errorlog() ? "yes" : "no");
   } else if (get_item == "slowlog-log-slower-than") {
-      ret = "*2\r\n";
-      EncodeString(&ret, "slowlog-log-slower-than");
-      EncodeInt32(&ret, g_pika_conf->slowlog_slower_than());
+    ret = "*2\r\n";
+    EncodeString(&ret, "slowlog-log-slower-than");
+    EncodeInt32(&ret, g_pika_conf->slowlog_slower_than());
+  } else if (get_item == "slowlog-max-len") {
+    ret = "*2\r\n";
+    EncodeString(&ret, "slowlog-max-len");
+    EncodeInt32(&ret, g_pika_conf->slowlog_max_len());
+  } else if (get_item == "write-binlog") {
+    ret = "*2\r\n";
+    EncodeString(&ret, "write-binlog");
+    EncodeString(&ret, g_pika_conf->write_binlog() ? "yes" : "no");
   } else if (get_item == "binlog-file-size") {
-      ret = "*2\r\n";
-      EncodeString(&ret, "binlog-file-size");
-      EncodeInt32(&ret, g_pika_conf->binlog_file_size());
+    ret = "*2\r\n";
+    EncodeString(&ret, "binlog-file-size");
+    EncodeInt32(&ret, g_pika_conf->binlog_file_size());
+  } else if (get_item == "identify-binlog-type") {
+    ret = "*2\r\n";
+    EncodeString(&ret, "identify-binlog-type");
+    EncodeString(&ret, g_pika_conf->identify_binlog_type());
   } else if (get_item == "compression") {
-      ret = "*2\r\n";
-      EncodeString(&ret, "compression");
-      EncodeString(&ret, g_pika_conf->compression());
+    ret = "*2\r\n";
+    EncodeString(&ret, "compression");
+    EncodeString(&ret, g_pika_conf->compression());
   } else if (get_item == "slave-read-only") {
     ret = "*2\r\n";
     EncodeString(&ret, "slave-read-only");
@@ -1158,7 +1182,7 @@ void ConfigCmd::ConfigGet(std::string &ret) {
     EncodeString(&ret, "slave-priority");
     EncodeInt32(&ret, g_pika_conf->slave_priority());
   } else if (get_item == "*") {
-    ret = "*86\r\n";
+    ret = "*104\r\n";
     EncodeString(&ret, "port");
     EncodeInt32(&ret, g_pika_conf->port());
     EncodeString(&ret, "double-master-ip");
@@ -1182,7 +1206,7 @@ void ConfigCmd::ConfigGet(std::string &ret) {
     EncodeString(&ret, "maxmemory");
     EncodeInt32(&ret, g_pika_conf->write_buffer_size());
     EncodeString(&ret, "write-buffer-size");
-    EncodeInt32(&ret, g_pika_conf->write_buffer_size());
+    EncodeInt64(&ret, g_pika_conf->write_buffer_size());
     EncodeString(&ret, "timeout");
     EncodeInt32(&ret, g_pika_conf->timeout());
     EncodeString(&ret, "requirepass");
@@ -1195,8 +1219,6 @@ void ConfigCmd::ConfigGet(std::string &ret) {
     EncodeString(&ret, g_pika_conf->suser_blacklist());
     EncodeString(&ret, "daemonize");
     EncodeInt32(&ret, g_pika_conf->daemonize());
-    EncodeString(&ret, "slotmigrate");
-    EncodeInt32(&ret, g_pika_conf->slotmigrate());
     EncodeString(&ret, "dump-path");
     EncodeString(&ret, g_pika_conf->bgsave_path());
     EncodeString(&ret, "dump-expire");
@@ -1217,18 +1239,38 @@ void ConfigCmd::ConfigGet(std::string &ret) {
     EncodeInt32(&ret, g_pika_conf->max_cache_files());
     EncodeString(&ret, "max-bytes-for-level-multiplier");
     EncodeInt32(&ret, g_pika_conf->max_bytes_for_level_multiplier());
+    EncodeString(&ret, "block-size");
+    EncodeInt64(&ret, g_pika_conf->block_size());
+    EncodeString(&ret, "block-cache");
+    EncodeInt64(&ret, g_pika_conf->block_cache());
+    EncodeString(&ret, "share-block-cache");
+    EncodeString(&ret, g_pika_conf->share_block_cache() ? "yes" : "no");
+    EncodeString(&ret, "cache-index-and-filter-blocks");
+    EncodeString(&ret, g_pika_conf->cache_index_and_filter_blocks() ? "yes" : "no");
+    EncodeString(&ret, "optimize-filters-for-hits");
+    EncodeString(&ret, g_pika_conf->optimize_filters_for_hits() ? "yes" : "no"); 
+    EncodeString(&ret, "level-compaction-dynamic-level-bytes");
+    EncodeString(&ret, g_pika_conf->level_compaction_dynamic_level_bytes() ? "yes" : "no");
     EncodeString(&ret, "expire-logs-days");
     EncodeInt32(&ret, g_pika_conf->expire_logs_days());
     EncodeString(&ret, "expire-logs-nums");
     EncodeInt32(&ret, g_pika_conf->expire_logs_nums());
     EncodeString(&ret, "root-connection-num");
     EncodeInt32(&ret, g_pika_conf->root_connection_num());
+    EncodeString(&ret, "slowlog-write-errorlog");
+    EncodeString(&ret, g_pika_conf->slowlog_write_errorlog() ? "yes" : "no");
     EncodeString(&ret, "slowlog-log-slower-than");
     EncodeInt32(&ret, g_pika_conf->slowlog_slower_than());
+    EncodeString(&ret, "slowlog-max-len");
+    EncodeInt32(&ret, g_pika_conf->slowlog_max_len());
     EncodeString(&ret, "slave-read-only");
     EncodeInt32(&ret, g_pika_conf->readonly());
+    EncodeString(&ret, "write-binlog");
+    EncodeString(&ret, g_pika_conf->write_binlog() ? "yes" : "no");
     EncodeString(&ret, "binlog-file-size");
     EncodeInt32(&ret, g_pika_conf->binlog_file_size());
+    EncodeString(&ret, "identify-binlog-type");
+    EncodeString(&ret, g_pika_conf->identify_binlog_type());
     EncodeString(&ret, "compression");
     EncodeString(&ret, g_pika_conf->compression());
     EncodeString(&ret, "db-sync-path");
@@ -1243,7 +1285,7 @@ void ConfigCmd::ConfigGet(std::string &ret) {
     EncodeString(&ret, g_pika_conf->network_interface());
     EncodeString(&ret, "slaveof");
     EncodeString(&ret, g_pika_conf->slaveof());
-    EncodeString(&ret, "slaveof-priority");
+    EncodeString(&ret, "slave-priority");
     EncodeInt32(&ret, g_pika_conf->slave_priority());
   } else {
     ret = "*0\r\n";
@@ -1253,12 +1295,11 @@ void ConfigCmd::ConfigGet(std::string &ret) {
 void ConfigCmd::ConfigSet(std::string& ret) {
   std::string set_item = config_args_v_[1];
   if (set_item == "*") {
-    ret = "*19\r\n";
+    ret = "*22\r\n";
     EncodeString(&ret, "loglevel");
     EncodeString(&ret, "timeout");
     EncodeString(&ret, "requirepass");
     EncodeString(&ret, "masterauth");
-    EncodeString(&ret, "slotmigrate");
     EncodeString(&ret, "userpass");
     EncodeString(&ret, "userblacklist");
     EncodeString(&ret, "dump-prefix");
@@ -1267,8 +1308,12 @@ void ConfigCmd::ConfigSet(std::string& ret) {
     EncodeString(&ret, "expire-logs-days");
     EncodeString(&ret, "expire-logs-nums");
     EncodeString(&ret, "root-connection-num");
+    EncodeString(&ret, "slowlog-write-errorlog");
     EncodeString(&ret, "slowlog-log-slower-than");
+    EncodeString(&ret, "slowlog-max-len");
     EncodeString(&ret, "slave-read-only");
+    EncodeString(&ret, "write-binlog");
+    EncodeString(&ret, "identify-binlog-type");
     EncodeString(&ret, "db-sync-speed");
     EncodeString(&ret, "compact-cron");
     EncodeString(&ret, "compact-interval");
@@ -1303,9 +1348,6 @@ void ConfigCmd::ConfigSet(std::string& ret) {
   } else if (set_item == "masterauth") {
     g_pika_conf->SetMasterAuth(value);
     ret = "+OK\r\n";
-  } else if (set_item == "slotmigrate") {
-    g_pika_conf->SetSlotMigrate(value);
-    ret = "+OK\r\n";
   } else if (set_item == "userpass") {
     g_pika_conf->SetUserPass(value);
     ret = "+OK\r\n";
@@ -1316,53 +1358,74 @@ void ConfigCmd::ConfigSet(std::string& ret) {
     g_pika_conf->SetBgsavePrefix(value);
     ret = "+OK\r\n";
   } else if (set_item == "maxclients") {
-    if (!slash::string2l(value.data(), value.size(), &ival)) {
-      ret = "-ERR Invalid argument " + value + " for CONFIG SET 'maxclients'\r\n";
+    if (!slash::string2l(value.data(), value.size(), &ival) || ival <= 0) {
+      ret = "-ERR Invalid argument \'" + value + "\' for CONFIG SET 'maxclients'\r\n";
       return;
     }
     g_pika_conf->SetMaxConnection(ival);
+    g_pika_server->SetDispatchQueueLimit(ival);
     ret = "+OK\r\n";
   } else if (set_item == "dump-expire") {
     if (!slash::string2l(value.data(), value.size(), &ival)) {
-      ret = "-ERR Invalid argument " + value + " for CONFIG SET 'dump-expire'\r\n";
+      ret = "-ERR Invalid argument \'" + value + "\' for CONFIG SET 'dump-expire'\r\n";
       return;
     }
     g_pika_conf->SetExpireDumpDays(ival);
     ret = "+OK\r\n";
   } else if (set_item == "slave-priority") {
      if (!slash::string2l(value.data(), value.size(), &ival)) {
-      ret = "-ERR Invalid argument " + value + " for CONFIG SET 'slave-priority'\r\n";
+      ret = "-ERR Invalid argument \'" + value + "\' for CONFIG SET 'slave-priority'\r\n";
       return;
     }
     g_pika_conf->SetSlavePriority(ival);
     ret = "+OK\r\n";
   } else if (set_item == "expire-logs-days") {
-    if (!slash::string2l(value.data(), value.size(), &ival)) {
-      ret = "-ERR Invalid argument " + value + " for CONFIG SET 'expire-logs-days'\r\n";
+    if (!slash::string2l(value.data(), value.size(), &ival) || ival <= 0) {
+      ret = "-ERR Invalid argument \'" + value + "\' for CONFIG SET 'expire-logs-days'\r\n";
       return;
     }
     g_pika_conf->SetExpireLogsDays(ival);
     ret = "+OK\r\n";
   } else if (set_item == "expire-logs-nums") {
-    if (!slash::string2l(value.data(), value.size(), &ival)) {
-      ret = "-ERR Invalid argument " + value + " for CONFIG SET 'expire-logs-nums'\r\n";
+    if (!slash::string2l(value.data(), value.size(), &ival) || ival <= 0) {
+      ret = "-ERR Invalid argument \'" + value + "\' for CONFIG SET 'expire-logs-nums'\r\n";
       return;
     }
     g_pika_conf->SetExpireLogsNums(ival);
     ret = "+OK\r\n";
   } else if (set_item == "root-connection-num") {
-    if (!slash::string2l(value.data(), value.size(), &ival)) {
-      ret = "-ERR Invalid argument " + value + " for CONFIG SET 'root-connection-num'\r\n";
+    if (!slash::string2l(value.data(), value.size(), &ival) || ival <= 0) {
+      ret = "-ERR Invalid argument \'" + value + "\' for CONFIG SET 'root-connection-num'\r\n";
       return;
     }
     g_pika_conf->SetRootConnectionNum(ival);
     ret = "+OK\r\n";
+  } else if (set_item == "slowlog-write-errorlog") {
+    bool is_write_errorlog;
+    if (value == "yes") {
+      is_write_errorlog = true;
+    } else if (value == "no") {
+      is_write_errorlog = false;
+    } else {
+      ret = "-ERR Invalid argument \'" + value + "\' for CONFIG SET 'slowlog-write-errorlog'\r\n";
+      return;
+    }
+    g_pika_conf->SetSlowlogWriteErrorlog(is_write_errorlog);
+    ret = "+OK\r\n";
   } else if (set_item == "slowlog-log-slower-than") {
-    if (!slash::string2l(value.data(), value.size(), &ival)) {
-      ret = "-ERR Invalid argument " + value + " for CONFIG SET 'slowlog-log-slower-than'\r\n";
+    if (!slash::string2l(value.data(), value.size(), &ival) || ival < 0) {
+      ret = "-ERR Invalid argument \'" + value + "\' for CONFIG SET 'slowlog-log-slower-than'\r\n";
       return;
     }
     g_pika_conf->SetSlowlogSlowerThan(ival);
+    ret = "+OK\r\n";
+  } else if (set_item == "slowlog-max-len") {
+    if (!slash::string2l(value.data(), value.size(), &ival) || ival < 0) {
+      ret = "-ERR Invalid argument \'" + value + "\' for CONFIG SET 'slowlog-max-len'\r\n";
+      return;
+    }
+    g_pika_conf->SetSlowlogMaxLen(ival);
+    g_pika_server->SlowlogTrim();
     ret = "+OK\r\n";
   } else if (set_item == "slave-read-only") {
     slash::StringToLower(value);
@@ -1372,14 +1435,38 @@ void ConfigCmd::ConfigSet(std::string& ret) {
     } else if (value == "0" || value == "no") {
       is_readonly = false;
     } else {
-      ret = "-ERR Invalid argument " + value + " for CONFIG SET 'slave-read-only'\r\n";
+      ret = "-ERR Invalid argument \'" + value + "\' for CONFIG SET 'slave-read-only'\r\n";
       return;
     }
     g_pika_conf->SetReadonly(is_readonly);
     ret = "+OK\r\n";
+  } else if (set_item == "identify-binlog-type") {
+    int role = g_pika_server->role();
+    if (role == PIKA_ROLE_SLAVE || role == PIKA_ROLE_DOUBLE_MASTER) {
+      ret = "-ERR need to close master-slave or double-master mode first\r\n";
+      return;
+    } else if (value != "new" && value != "old") {
+      ret = "-ERR invalid identify-binlog-type (new or old)\r\n";
+      return;
+    } else {
+      g_pika_conf->SetIdentifyBinlogType(value);
+      ret = "+OK\r\n";
+    }
+  } else if (set_item == "write-binlog") {
+    int role = g_pika_server->role();
+    if (role == PIKA_ROLE_SLAVE || role == PIKA_ROLE_DOUBLE_MASTER) {
+      ret = "-ERR need to close master-slave or double-master mode first\r\n";
+      return;
+    } else if (value != "yes" && value != "no") {
+      ret = "-ERR invalid write-binlog (yes or no)\r\n";
+      return;
+    } else {
+      g_pika_conf->SetWriteBinlog(value);
+      ret = "+OK\r\n";
+    }
   } else if (set_item == "db-sync-speed") {
     if (!slash::string2l(value.data(), value.size(), &ival)) {
-      ret = "-ERR Invalid argument " + value + " for CONFIG SET 'db-sync-speed(MB)'\r\n";
+      ret = "-ERR Invalid argument \'" + value + "\' for CONFIG SET 'db-sync-speed(MB)'\r\n";
       return;
     }
     if (ival < 0 || ival > 125) {
@@ -1436,7 +1523,7 @@ void ConfigCmd::ConfigSet(std::string& ret) {
       ret = "+OK\r\n";
     }
   } else {
-    ret = "-ERR No such configure item\r\n";
+    ret = "-ERR Unsupported CONFIG parameter: " + set_item + "\r\n";
   }
 }
 
@@ -1470,29 +1557,13 @@ void DbsizeCmd::DoInitial(PikaCmdArgsType &argv, const CmdInfo* const ptr_info) 
 }
 
 void DbsizeCmd::Do() {
-  if (g_pika_conf->slotmigrate()){
-    int64_t dbsize = 0;
-    for (int i = 0; i < HASH_SLOTS_SIZE; ++i){
-      int64_t card = 0;
-      card = g_pika_server->db()->SCard(SlotKeyPrefix+std::to_string(i));
-      if (card >= 0) {
-        dbsize += card;
-      }else {
-        res_.SetRes(CmdRes::kErrOther, "Get dbsize error");
-        return;
-      }
-    }
-    res_.AppendInteger(dbsize);
-    return;
-  }
-
   PikaServer::KeyScanInfo key_scan_info = g_pika_server->key_scan_info();
   std::vector<uint64_t> &key_nums_v = key_scan_info.key_nums_v;
   if (key_scan_info.key_nums_v.size() != 5) {
     res_.SetRes(CmdRes::kErrOther, "keyspace error");
     return;
   }
-  int32_t dbsize = key_nums_v[0] + key_nums_v[1] + key_nums_v[2] + key_nums_v[3] + key_nums_v[4];
+  int64_t dbsize = key_nums_v[0] + key_nums_v[1] + key_nums_v[2] + key_nums_v[3] + key_nums_v[4];
   res_.AppendInteger(dbsize);
 }
 
@@ -1576,6 +1647,96 @@ void DelbackupCmd::Do() {
   }
 
   res_.SetRes(CmdRes::kOk);
+  return;
+}
+
+void EchoCmd::DoInitial(PikaCmdArgsType &argv, const CmdInfo* const ptr_info) {
+  if (!ptr_info->CheckArg(argv.size())) {
+    res_.SetRes(CmdRes::kWrongNum, kCmdNameEcho);
+    return;
+  }
+  body_ = argv[1];
+  return;
+}
+
+void EchoCmd::Do() {
+  res_.AppendString(body_);
+  return;
+}
+
+void ScandbCmd::DoInitial(PikaCmdArgsType &argv, const CmdInfo* const ptr_info) {
+  if (!ptr_info->CheckArg(argv.size())) {
+    res_.SetRes(CmdRes::kWrongNum, kCmdNameEcho);
+    return;
+  }
+  if (argv.size() == 1) {
+    type_ = blackwidow::kAll;
+  } else {
+    if (!strcasecmp(argv[1].data(),"string")) {
+      type_ = blackwidow::kStrings;
+    } else if (!strcasecmp(argv[1].data(), "hash")) {
+      type_ = blackwidow::kHashes;
+    } else if (!strcasecmp(argv[1].data(), "set")) {
+      type_ = blackwidow::kSets;
+    } else if (!strcasecmp(argv[1].data(), "zset")) {
+      type_ = blackwidow::kZSets;
+    } else if (!strcasecmp(argv[1].data(), "list")) {
+      type_ = blackwidow::kLists;
+    } else {
+      res_.SetRes(CmdRes::kInvalidDbType);
+    }
+  }
+  return;
+}
+
+void ScandbCmd::Do() {
+  g_pika_server->db()->ScanDatabase(type_);
+  res_.SetRes(CmdRes::kOk);
+  return;
+}
+
+void SlowlogCmd::DoInitial(PikaCmdArgsType &argv, const CmdInfo* const ptr_info) {
+  if (!ptr_info->CheckArg(argv.size())) {
+    res_.SetRes(CmdRes::kWrongNum, kCmdNameSlowlog);
+    return;
+  }
+  if (argv.size() == 2 && !strcasecmp(argv[1].data(), "reset")) {
+    condition_ = SlowlogCmd::kRESET;
+  } else if (argv.size() == 2 && !strcasecmp(argv[1].data(), "len")) {
+    condition_ = SlowlogCmd::kLEN;
+  } else if ((argv.size() == 2 || argv.size() == 3) && !strcasecmp(argv[1].data(), "get")) {
+    condition_ = SlowlogCmd::kGET;
+    if (argv.size() == 3 && !slash::string2l(argv[2].data(), argv[2].size(), &number_)) {
+      res_.SetRes(CmdRes::kInvalidInt);
+      return;
+    }
+  } else {
+    res_.SetRes(CmdRes::kErrOther, "Unknown SLOWLOG subcommand or wrong # of args. Try GET, RESET, LEN.");
+    return;
+  }
+}
+
+void SlowlogCmd::Do() {
+  if (condition_ == SlowlogCmd::kRESET) {
+    g_pika_server->SlowlogReset();
+    res_.SetRes(CmdRes::kOk);
+  } else if (condition_ ==  SlowlogCmd::kLEN) {
+    res_.AppendInteger(g_pika_server->SlowlogLen());
+  } else {
+    std::vector<SlowlogEntry> slowlogs;
+    g_pika_server->SlowlogObtain(number_, &slowlogs);
+    res_.AppendArrayLen(slowlogs.size());
+    for (const auto& slowlog : slowlogs) {
+      res_.AppendArrayLen(4);
+      res_.AppendInteger(slowlog.id);
+      res_.AppendInteger(slowlog.start_time);
+      res_.AppendInteger(slowlog.duration);
+      res_.AppendArrayLen(slowlog.argv.size());
+      for (const auto& arg : slowlog.argv) {
+        res_.AppendString(arg);
+      }
+    }
+  }
   return;
 }
 

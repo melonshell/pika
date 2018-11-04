@@ -88,6 +88,8 @@ std::string PikaClientConn::DoCmd(
   if (!c_ptr->res().ok()) {
     return c_ptr->res().message();
   }
+
+  g_pika_server->UpdateQueryNumAndExecCountTable(argv[0]);
  
   // PubSub connection
   if (this->IsPubSub()) {
@@ -109,8 +111,8 @@ std::string PikaClientConn::DoCmd(
     return ""; // Monitor thread will return "OK"
   }
 
-  // PubSub
-  if (opt == kCmdNameSubscribe) {                                   // Subscribe
+  //PubSub
+  if (opt == kCmdNamePSubscribe || opt == kCmdNameSubscribe) {             // PSubscribe or Subscribe
     pink::PinkConn* conn = this;
     if (!this->IsPubSub()) {
       conn = server_thread_->MoveConnOut(fd());
@@ -120,16 +122,16 @@ std::string PikaClientConn::DoCmd(
       channels.push_back(slash::StringToLower(argv[i]));
     }
     std::vector<std::pair<std::string, int>> result;
-    g_pika_server->Subscribe(conn, channels, false, &result);
+    g_pika_server->Subscribe(conn, channels, opt == kCmdNamePSubscribe, &result);
     this->SetIsPubSub(true);
-    return ConstructPubSubResp(kCmdNameSubscribe, result);
-  } else if (opt == kCmdNameUnSubscribe) {                          // UnSubscribe
+    return ConstructPubSubResp(opt, result);
+  } else if (opt == kCmdNamePUnSubscribe || opt == kCmdNameUnSubscribe) {  // PUnSubscribe or UnSubscribe
     std::vector<std::string > channels;
     for (size_t i = 1; i < argv.size(); i++) {
       channels.push_back(slash::StringToLower(argv[i]));
     }
     std::vector<std::pair<std::string, int>> result;
-    int subscribed = g_pika_server->UnSubscribe(this, channels, false, &result);
+    int subscribed = g_pika_server->UnSubscribe(this, channels, opt == kCmdNamePUnSubscribe, &result);
     if (subscribed == 0 && this->IsPubSub()) {
       /*
        * if the number of client subscribed is zero,
@@ -138,39 +140,9 @@ std::string PikaClientConn::DoCmd(
       server_thread_->HandleNewConn(fd(), ip_port());
       this->SetIsPubSub(false);
     }
-    return ConstructPubSubResp(kCmdNameUnSubscribe, result);
-  } else if (opt == kCmdNamePSubscribe) {                           // PSubscribe
-    pink::PinkConn* conn = this;
-    if (!this->IsPubSub()) {
-      conn = server_thread_->MoveConnOut(fd());
-    }
-    std::vector<std::string > channels;
-    for (size_t i = 1; i < argv.size(); i++) {
-      channels.push_back(slash::StringToLower(argv[i]));
-    }
-    std::vector<std::pair<std::string, int>> result;
-    g_pika_server->Subscribe(conn, channels, true, &result);
-    this->SetIsPubSub(true);
-    return ConstructPubSubResp(kCmdNamePSubscribe, result);
-  } else if (opt == kCmdNamePUnSubscribe) {                          // PUnSubscribe
-    std::vector<std::string > channels;
-    for (size_t i = 1; i < argv.size(); i++) {
-      channels.push_back(slash::StringToLower(argv[i]));
-    }
-    std::vector<std::pair<std::string, int>> result;
-    int subscribed = g_pika_server->UnSubscribe(this, channels, true, &result);
-    if (subscribed == 0 && this->IsPubSub()) {
-      /*
-       * if the number of client subscribed is zero,
-       * the client will exit the Pub/Sub state
-       */
-      server_thread_->HandleNewConn(fd(), ip_port());
-      this->SetIsPubSub(false);
-    }
-    return ConstructPubSubResp(kCmdNamePUnSubscribe, result);
+    return ConstructPubSubResp(opt, result);
   }
 
-  bool need_send_to_hub = false;
   if (cinfo_ptr->is_write()) {
     if (g_pika_server->BinlogIoError()) {
       return "-ERR Writing binlog failed, maybe no space left on device\r\n";
@@ -179,9 +151,6 @@ std::string PikaClientConn::DoCmd(
       return "-ERR Server in read-only\r\n";
     }
     if (argv.size() >= 2) {
-      if (cinfo_ptr->flag_type() & kCmdFlagsKv) {
-        need_send_to_hub = true;
-      }
       g_pika_server->mutex_record_.Lock(argv[1]);
     }
   }
@@ -194,22 +163,21 @@ std::string PikaClientConn::DoCmd(
   uint32_t exec_time = time(nullptr);
   c_ptr->Do();
 
-  if (cinfo_ptr->is_write()) {
+  if (g_pika_conf->write_binlog()
+    && cinfo_ptr->is_write()) {
     if (c_ptr->res().ok()) {
       g_pika_server->logger_->Lock();
       uint32_t filenum = 0;
       uint64_t offset = 0;
-      std::string binlog_info;
-      g_pika_server->logger_->GetProducerStatus(&filenum, &offset);
-      slash::PutFixed32(&binlog_info, exec_time);
-      slash::PutFixed32(&binlog_info, filenum);
-      slash::PutFixed64(&binlog_info, offset);
+      uint64_t logic_id = 0;
+      g_pika_server->logger_->GetProducerStatus(&filenum, &offset, &logic_id);
 
-      std::string binlog = c_ptr->ToBinlog(
-          argv,
-          g_pika_conf->server_id(),
-          binlog_info,
-          need_send_to_hub);
+      std::string binlog = c_ptr->ToBinlog(argv,
+                                           exec_time,
+                                           g_pika_conf->server_id(),
+                                           logic_id,
+                                           filenum,
+                                           offset);
       slash::Status s;
       if (!binlog.empty()) {
         s = g_pika_server->logger_->Put(binlog);
@@ -236,19 +204,23 @@ std::string PikaClientConn::DoCmd(
   }
 
   if (g_pika_conf->slowlog_slower_than() >= 0) {
+    int32_t start_time = start_us / 1000000;
     int64_t duration = slash::NowMicros() - start_us;
     if (duration > g_pika_conf->slowlog_slower_than()) {
-      std::string slow_log;
-      for (unsigned int i = 0; i < argv.size(); i++) {
-        slow_log.append(" ");
-        slow_log.append(slash::ToRead(argv[i]));
-        if (slow_log.size() >= 1000) {
-          slow_log.resize(1000);
-          slow_log.append("...\"");
-          break;
+      g_pika_server->SlowlogPushEntry(argv, start_time, duration);
+      if (g_pika_conf->slowlog_write_errorlog()) {
+        std::string slow_log;
+        for (unsigned int i = 0; i < argv.size(); i++) {
+          slow_log.append(" ");
+          slow_log.append(slash::ToRead(argv[i]));
+          if (slow_log.size() >= 1000) {
+            slow_log.resize(1000);
+            slow_log.append("...\"");
+            break;
+          }
         }
+        LOG(ERROR) << "ip_port: "<< ip_port() << ", command:" << slow_log << ", start_time(s): " << start_time << ", duration(us): " << duration;
       }
-      LOG(ERROR) << "command:" << slow_log << ", start_time(s): " << start_us / 1000000 << ", duration(us): " << duration;
     }
   }
 
@@ -262,7 +234,6 @@ std::string PikaClientConn::DoCmd(
 
 int PikaClientConn::DealMessage(
     PikaCmdArgsType& argv, std::string* response) {
-  g_pika_server->PlusThreadQuerynum();
 
   if (argv.empty()) return -2;
   std::string opt = argv[0];

@@ -13,6 +13,7 @@
 
 #include "include/pika_command.h"
 #include "include/pika_client_conn.h"
+#include "blackwidow/blackwidow.h"
 
 /*
  * Admin
@@ -51,20 +52,6 @@ class TrysyncCmd : public Cmd {
   int64_t slave_port_;
   int64_t filenum_;
   int64_t pro_offset_;
-  virtual void DoInitial(PikaCmdArgsType &argvs, const CmdInfo* const ptr_info);
-};
-
-class InternalTrysyncCmd : public Cmd {
- public:
-  InternalTrysyncCmd() {}
-  virtual void Do();
-
- private:
-  std::string hub_ip_;
-  int64_t hub_port_;
-  int64_t filenum_;
-  int64_t pro_offset_;
-  bool send_most_recently_;
   virtual void DoInitial(PikaCmdArgsType &argvs, const CmdInfo* const ptr_info);
 };
 
@@ -187,14 +174,15 @@ class InfoCmd : public Cmd {
     kInfoErr = 0x0,
     kInfoServer,
     kInfoClients,
-    kInfoHub,
     kInfoStats,
+    kInfoExecCount,
     kInfoCPU,
     kInfoReplication,
     kInfoKeyspace,
     kInfoBgstats,
     kInfoLog,
     kInfoData,
+    kInfo,
     kInfoAll,
     kInfoDoubleMaster
   };
@@ -207,11 +195,12 @@ class InfoCmd : public Cmd {
   bool rescan_; //whether to rescan the keyspace
   bool off_;
 
+  const static std::string kInfoSection;
   const static std::string kAllSection;
   const static std::string kServerSection;
   const static std::string kClientsSection;
-  const static std::string kHubSection;
   const static std::string kStatsSection;
+  const static std::string kExecCountSection;
   const static std::string kCPUSection;
   const static std::string kReplicationSection;
   const static std::string kKeyspaceSection;
@@ -227,8 +216,8 @@ class InfoCmd : public Cmd {
 
   void InfoServer(std::string &info);
   void InfoClients(std::string &info);
-  void InfoHub(std::string &info);
   void InfoStats(std::string &info);
+  void InfoExecCount(std::string &info);
   void InfoCPU(std::string &info);
   void InfoReplication(std::string &info);
   void InfoKeyspace(std::string &info);
@@ -294,6 +283,44 @@ class DelbackupCmd : public Cmd {
 
  private:
   virtual void DoInitial(PikaCmdArgsType &argv, const CmdInfo* const ptr_info);
+};
+
+class EchoCmd : public Cmd {
+ public:
+  EchoCmd() {}
+  virtual void Do();
+
+ private:
+  std::string body_;
+  virtual void DoInitial(PikaCmdArgsType &argv, const CmdInfo* const ptr_info);
+};
+
+class ScandbCmd : public Cmd {
+ public:
+  ScandbCmd() : type_(blackwidow::kAll) {}
+  virtual void Do();
+
+ private:
+  blackwidow::DataType type_;
+  virtual void DoInitial(PikaCmdArgsType &argv, const CmdInfo* const ptr_info);
+  virtual void Clear() {
+    type_ = blackwidow::kAll;
+  }
+};
+
+class SlowlogCmd : public Cmd {
+ public:
+  enum SlowlogCondition{kGET, kLEN, kRESET};
+  SlowlogCmd() : condition_(kGET) {}
+  virtual void Do();
+ private:
+  int64_t number_;
+  SlowlogCmd::SlowlogCondition condition_;
+  virtual void DoInitial(PikaCmdArgsType &argv, const CmdInfo* const ptr_info);
+  virtual void Clear() {
+    number_ = 10;
+    condition_ = kGET;
+  }
 };
 
 #ifdef TCMALLOC_EXTENSION

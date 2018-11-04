@@ -6,8 +6,6 @@
 #ifndef PIKA_SET_H_
 #define PIKA_SET_H_
 #include "include/pika_command.h"
-#include "nemo.h"
-
 
 /*
  * set
@@ -156,9 +154,11 @@ public:
 private:
   std::string key_;
   int64_t count_;
+  bool reply_arr;
   virtual void DoInitial(PikaCmdArgsType &argvs, const CmdInfo* const ptr_info);
   virtual void Clear() {
     count_ = 1;
+    reply_arr = false;
   }
 };
 

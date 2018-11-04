@@ -6,7 +6,7 @@
 #ifndef PIKA_HASH_H_
 #define PIKA_HASH_H_
 #include "include/pika_command.h"
-#include "nemo.h"
+#include "blackwidow/blackwidow.h"
 
 
 /*
@@ -74,8 +74,7 @@ public:
   HIncrbyfloatCmd() {}
   virtual void Do();
 private:
-  std::string key_, field_;
-  double by_;
+  std::string key_, field_, by_;
   virtual void DoInitial(PikaCmdArgsType &argvs, const CmdInfo* const ptr_info);
 };
 
@@ -113,7 +112,7 @@ public:
   virtual void Do();
 private:
   std::string key_;
-  std::vector<nemo::FV> fv_v_;
+  std::vector<blackwidow::FieldValue> fvs_;
   virtual void DoInitial(PikaCmdArgsType &argvs, const CmdInfo* const ptr_info);
 };
 
@@ -151,11 +150,58 @@ public:
 private:
   std::string key_, pattern_;
   int64_t cursor_, count_;
-  bool use_pattern_, use_count_;
   virtual void DoInitial(PikaCmdArgsType &argvs, const CmdInfo* const ptr_info);
   virtual void Clear() {
     pattern_ = "*";
     count_ = 10;
+  }
+};
+
+class HScanxCmd : public Cmd {
+public:
+  HScanxCmd() : pattern_("*"), count_(10) {}
+  virtual void Do();
+private:
+  std::string key_, start_field_, pattern_;
+  int64_t count_;
+  virtual void DoInitial(PikaCmdArgsType &argvs, const CmdInfo* const ptr_info);
+  virtual void Clear() {
+    pattern_ = "*";
+    count_ = 10;
+  }
+};
+
+class PKHScanRangeCmd : public Cmd {
+public:
+  PKHScanRangeCmd() : pattern_("*"), limit_(10) {}
+  virtual void Do();
+private:
+  std::string key_;
+  std::string field_start_;
+  std::string field_end_;
+  std::string pattern_;
+  int64_t limit_;
+  virtual void DoInitial(PikaCmdArgsType &argvs, const CmdInfo* const ptr_info);
+  virtual void Clear() {
+    pattern_ = "*";
+    limit_ = 10;
+  }
+};
+
+class PKHRScanRangeCmd : public Cmd {
+public:
+  PKHRScanRangeCmd() : pattern_("*"), limit_(10) {}
+  virtual void Do();
+private:
+  std::string key_;
+  std::string field_start_;
+  std::string field_end_;
+  std::string pattern_;
+  int64_t limit_;
+  virtual void DoInitial(PikaCmdArgsType &argvs, const CmdInfo* const ptr_info);
+  virtual void Clear() {
+    pattern_ = "*";
+    limit_ = 10;
   }
 };
 #endif

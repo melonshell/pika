@@ -4,10 +4,8 @@
 // of patent rights can be found in the PATENTS file in the same directory.
 
 #include "slash/include/slash_string.h"
-#include "nemo.h"
 #include "include/pika_hash.h"
 #include "include/pika_server.h"
-#include "include/pika_slot.h"
 
 extern PikaServer *g_pika_server;
 
@@ -25,17 +23,13 @@ void HDelCmd::DoInitial(PikaCmdArgsType &argv, const CmdInfo* const ptr_info) {
 }
 
 void HDelCmd::Do() {
-  int64_t num = 0;
-  nemo::Status s;
-  size_t index = 0, fields_num = fields_.size();
-  for (; index != fields_num; index++) {
-    s = g_pika_server->db()->HDel(key_, fields_[index]);
-    if (s.ok()) {
-      num++;
-    }
+  int32_t num = 0;
+  rocksdb::Status s = g_pika_server->db()->HDel(key_, fields_, &num);
+  if (s.ok() || s.IsNotFound()) {
+    res_.AppendInteger(num);
+  } else {
+    res_.SetRes(CmdRes::kErrOther, s.ToString());
   }
-  res_.AppendInteger(num);
-  KeyNotExistsRem("h", key_);
   return;
 }
 
@@ -47,6 +41,17 @@ void HSetCmd::DoInitial(PikaCmdArgsType &argv, const CmdInfo* const ptr_info) {
   key_ = argv[1];
   field_ = argv[2];
   value_ = argv[3];
+  return;
+}
+
+void HSetCmd::Do() {
+  int32_t ret = 0;
+  rocksdb::Status s = g_pika_server->db()->HSet(key_, field_, value_, &ret);
+  if (s.ok()) {
+    res_.AppendContent(":" + std::to_string(ret));
+  } else {
+    res_.SetRes(CmdRes::kErrOther, s.ToString());
+  }
   return;
 }
 
@@ -62,7 +67,7 @@ void HGetCmd::DoInitial(PikaCmdArgsType &argv, const CmdInfo* const ptr_info) {
 
 void HGetCmd::Do() {
   std::string value;
-  nemo::Status s = g_pika_server->db()->HGet(key_, field_, &value);
+  rocksdb::Status s = g_pika_server->db()->HGet(key_, field_, &value);
   if (s.ok()) {
     res_.AppendStringLen(value.size());
     res_.AppendContent(value);
@@ -83,16 +88,15 @@ void HGetallCmd::DoInitial(PikaCmdArgsType &argv, const CmdInfo* const ptr_info)
 }
 
 void HGetallCmd::Do() {
-  std::vector<nemo::FV> fvs;
-  nemo::Status s = g_pika_server->db()->HGetall(key_, fvs);
-  if (s.ok()) {
-    res_.AppendArrayLen(fvs.size()*2);
-    std::vector<nemo::FV>::const_iterator iter;
-    for (iter = fvs.begin(); iter != fvs.end(); iter++) {
-      res_.AppendStringLen(iter->field.size());
-      res_.AppendContent(iter->field);
-      res_.AppendStringLen(iter->val.size());
-      res_.AppendContent(iter->val);
+  std::vector<blackwidow::FieldValue> fvs;
+  rocksdb::Status s = g_pika_server->db()->HGetall(key_, &fvs);
+  if (s.ok() || s.IsNotFound()) {
+    res_.AppendArrayLen(fvs.size() * 2);
+    for (const auto& fv : fvs) {
+      res_.AppendStringLen(fv.field.size());
+      res_.AppendContent(fv.field);
+      res_.AppendStringLen(fv.value.size());
+      res_.AppendContent(fv.value);
     }
   } else {
     res_.SetRes(CmdRes::kErrOther, s.ToString());
@@ -100,33 +104,6 @@ void HGetallCmd::Do() {
   return;
 }
 
-static void DoHSet(const std::string &key, const std::string &field, const std::string &value, CmdRes& res, const std::string &exp_res) {
-  nemo::Status s = g_pika_server->db()->HSet(key, field, value);
-  if (s.ok()) {
-    res.AppendContent(exp_res);
-  } else {
-    res.SetRes(CmdRes::kErrOther, s.ToString());
-  }
-}
-
-void HSetCmd::Do() {
-  std::string tmp;
-  nemo::Status s = g_pika_server->db()->HGet(key_, field_, &tmp);
-  if (s.ok()) {
-    if (tmp != value_) {
-      DoHSet(key_, field_, value_, res_, ":0");
-      SlotKeyAdd("h", key_);
-    } else {
-      res_.AppendContent(":0");
-    }
-  } else if (s.IsNotFound()) {
-    DoHSet(key_, field_, value_, res_, ":1");
-    SlotKeyAdd("h", key_);
-  } else {
-    res_.SetRes(CmdRes::kErrOther, s.ToString());
-  }
-  return;
-}
 
 void HExistsCmd::DoInitial(PikaCmdArgsType &argv, const CmdInfo* const ptr_info) {
   if (!ptr_info->CheckArg(argv.size())) {
@@ -139,12 +116,13 @@ void HExistsCmd::DoInitial(PikaCmdArgsType &argv, const CmdInfo* const ptr_info)
 }
 
 void HExistsCmd::Do() {
-  std::string value;
-  bool exist = g_pika_server->db()->HExists(key_, field_);
-  if (exist) {
+  rocksdb::Status s = g_pika_server->db()->HExists(key_, field_);
+  if (s.ok()) {
     res_.AppendContent(":1");
-  } else {
+  } else if (s.IsNotFound()) {
     res_.AppendContent(":0");
+  } else {
+    res_.SetRes(CmdRes::kErrOther, s.ToString());
   }
 }
 
@@ -163,12 +141,11 @@ void HIncrbyCmd::DoInitial(PikaCmdArgsType &argv, const CmdInfo* const ptr_info)
 }
 
 void HIncrbyCmd::Do() {
-  std::string new_value;
-  nemo::Status s = g_pika_server->db()->HIncrby(key_, field_, by_, new_value);
+  int64_t new_value;
+  rocksdb::Status s = g_pika_server->db()->HIncrby(key_, field_, by_, &new_value);
   if (s.ok() || s.IsNotFound()) {
-    res_.AppendContent(":" + new_value);
-    SlotKeyAdd("h", key_);
-  } else if (s.IsCorruption() && s.ToString() == "Corruption: value is not integer") {
+    res_.AppendContent(":" + std::to_string(new_value));
+  } else if (s.IsCorruption() && s.ToString() == "Corruption: hash value is not an integer") {
     res_.SetRes(CmdRes::kInvalidInt);
   } else if (s.IsInvalidArgument()) {
     res_.SetRes(CmdRes::kOverFlow);
@@ -185,21 +162,17 @@ void HIncrbyfloatCmd::DoInitial(PikaCmdArgsType &argv, const CmdInfo* const ptr_
   }
   key_ = argv[1];
   field_ = argv[2];
-  if (argv[3].find(" ") != std::string::npos || !slash::string2d(argv[3].data(), argv[3].size(), &by_)) {
-    res_.SetRes(CmdRes::kInvalidFloat);
-    return;
-  }
+  by_ = argv[3];
   return;
 }
 
 void HIncrbyfloatCmd::Do() {
   std::string new_value;
-  nemo::Status s = g_pika_server->db()->HIncrbyfloat(key_, field_, by_, new_value);
+  rocksdb::Status s = g_pika_server->db()->HIncrbyfloat(key_, field_, by_, &new_value);
   if (s.ok()) {
     res_.AppendStringLen(new_value.size());
     res_.AppendContent(new_value);
-    SlotKeyAdd("h", key_);
-  } else if (s.IsCorruption() && s.ToString() == "Corruption: value is not float") {
+  } else if (s.IsCorruption() && s.ToString() == "Corruption: value is not a vaild float") {
     res_.SetRes(CmdRes::kInvalidFloat);
   } else if (s.IsInvalidArgument()) {
     res_.SetRes(CmdRes::kOverFlow);
@@ -220,13 +193,11 @@ void HKeysCmd::DoInitial(PikaCmdArgsType &argv, const CmdInfo* const ptr_info) {
 
 void HKeysCmd::Do() {
   std::vector<std::string> fields;
-  nemo::Status s = g_pika_server->db()->HKeys(key_, fields);
-  if (s.ok()) {
+  rocksdb::Status s = g_pika_server->db()->HKeys(key_, &fields);
+  if (s.ok() || s.IsNotFound()) {
     res_.AppendArrayLen(fields.size());
-    std::vector<std::string>::const_iterator iter;
-    for (iter = fields.begin(); iter != fields.end(); iter++) {
-      res_.AppendStringLen(iter->size());
-      res_.AppendContent(*iter);
+    for (const auto& field : fields) {
+      res_.AppendString(field);
     }
   } else {
     res_.SetRes(CmdRes::kErrOther, s.ToString());
@@ -244,9 +215,9 @@ void HLenCmd::DoInitial(PikaCmdArgsType &argv, const CmdInfo* const ptr_info) {
 }
 
 void HLenCmd::Do() {
-  int64_t len = 0;
-  len = g_pika_server->db()->HLen(key_);
-  if (len >= 0) {
+  int32_t len = 0;
+  rocksdb::Status s = g_pika_server->db()->HLen(key_, &len);
+  if (s.ok() || s.IsNotFound()) {
     res_.AppendInteger(len);
   } else {
     res_.SetRes(CmdRes::kErrOther, "something wrong in hlen");
@@ -268,15 +239,14 @@ void HMgetCmd::DoInitial(PikaCmdArgsType &argv, const CmdInfo* const ptr_info) {
 }
 
 void HMgetCmd::Do() {
-  std::vector<nemo::FVS> fvs_v;
-  nemo::Status s = g_pika_server->db()->HMGet(key_, fields_, fvs_v);
-  if (s.ok()) {
-    res_.AppendArrayLen(fvs_v.size());
-    std::vector<nemo::FVS>::const_iterator iter = fvs_v.begin();
-    for (; iter != fvs_v.end(); iter++) {
-      if ((iter->status).ok()) {
-        res_.AppendStringLen(iter->val.size());
-        res_.AppendContent(iter->val);
+  std::vector<std::string> values;
+  rocksdb::Status s = g_pika_server->db()->HMGet(key_, fields_, &values);
+  if (s.ok() || s.IsNotFound()) {
+    res_.AppendArrayLen(values.size());
+    for (const auto& value : values) {
+      if (!value.empty()) {
+        res_.AppendStringLen(value.size());
+        res_.AppendContent(value);
       } else {
         res_.AppendContent("$-1");
       }
@@ -299,18 +269,17 @@ void HMsetCmd::DoInitial(PikaCmdArgsType &argv, const CmdInfo* const ptr_info) {
     return;
   }
   size_t index = 2;
-  fv_v_.clear();
+  fvs_.clear();
   for (; index < argc; index += 2) {
-    fv_v_.push_back({argv[index], argv[index+1]});  
+    fvs_.push_back({argv[index], argv[index + 1]});
   }
   return;
 }
 
 void HMsetCmd::Do() {
-  nemo::Status s = g_pika_server->db()->HMSet(key_, fv_v_);
+  rocksdb::Status s = g_pika_server->db()->HMSet(key_, fvs_);
   if (s.ok()) {
     res_.SetRes(CmdRes::kOk);
-    SlotKeyAdd("h", key_);
   } else {
     res_.SetRes(CmdRes::kErrOther, s.ToString());
   }
@@ -329,12 +298,10 @@ void HSetnxCmd::DoInitial(PikaCmdArgsType &argv, const CmdInfo* const ptr_info) 
 }
 
 void HSetnxCmd::Do() {
-  nemo::Status s = g_pika_server->db()->HSetnx(key_, field_, value_);
+  int32_t ret = 0;
+  rocksdb::Status s = g_pika_server->db()->HSetnx(key_, field_, value_, &ret);
   if (s.ok()) {
-    res_.AppendContent(":1");
-    SlotKeyAdd("h", key_);
-  } else if (s.IsCorruption() && s.ToString() == "Corruption: Already Exist") {
-    res_.AppendContent(":0");
+    res_.AppendContent(":" + std::to_string(ret));
   } else {
     res_.SetRes(CmdRes::kErrOther, s.ToString());
   }
@@ -351,8 +318,9 @@ void HStrlenCmd::DoInitial(PikaCmdArgsType &argv, const CmdInfo* const ptr_info)
 }
 
 void HStrlenCmd::Do() {
-  int64_t len = g_pika_server->db()->HStrlen(key_, field_);
-  if (len >= 0) {
+  int32_t len = 0;
+  rocksdb::Status s = g_pika_server->db()->HStrlen(key_, field_, &len);
+  if (s.ok() || s.IsNotFound()) {
     res_.AppendInteger(len);
   } else {
     res_.SetRes(CmdRes::kErrOther, "something wrong in hstrlen");
@@ -370,14 +338,13 @@ void HValsCmd::DoInitial(PikaCmdArgsType &argv, const CmdInfo* const ptr_info) {
 }
 
 void HValsCmd::Do() {
-  std::vector<std::string> vals;
-  nemo::Status s = g_pika_server->db()->HVals(key_, vals);
-  if (s.ok()) {
-    res_.AppendArrayLen(vals.size());
-    std::vector<std::string>::const_iterator iter = vals.begin();
-    for (; iter != vals.end(); iter++) {
-      res_.AppendStringLen(iter->size());
-      res_.AppendContent(*iter);
+  std::vector<std::string> values;
+  rocksdb::Status s = g_pika_server->db()->HVals(key_, &values);
+  if (s.ok() || s.IsNotFound()) {
+    res_.AppendArrayLen(values.size());
+    for (const auto& value : values) {
+      res_.AppendStringLen(value.size());
+      res_.AppendContent(value);
     }
   } else {
     res_.SetRes(CmdRes::kErrOther, s.ToString());
@@ -425,52 +392,189 @@ void HScanCmd::DoInitial(PikaCmdArgsType &argv, const CmdInfo* const ptr_info) {
 }
 
 void HScanCmd::Do() {
-  int64_t hlen = g_pika_server->db()->HLen(key_);
-  if (hlen >= 0 && cursor_ >= hlen) {
-    cursor_ = 0;
-  }
-  if (hlen <= 512) {
-    count_ = 512;
-  }
-  nemo::HIterator *iter = g_pika_server->db()->HScan(key_, "", "", -1);
-  iter->Skip(cursor_);
-  if (!iter->Valid()) {
-    delete iter;
-    iter = g_pika_server->db()->HScan(key_, "", "", -1);
-    cursor_ = 0;
-  }
-  std::vector<nemo::FV> fv_v;
-  bool use_pattern = false;
-  if (pattern_ != "*") {
-    use_pattern = true;
-  }
-  for (; iter->Valid() && count_; iter->Next()) {
-    count_--;
-    cursor_++;
-    if (use_pattern && !slash::stringmatchlen(pattern_.data(), pattern_.size(), iter->field().data(), iter->field().size(), 0)) {
-      continue;
-    } 
-    fv_v.push_back({iter->field(), iter->value()});
-  }
-  if (!(iter->Valid())) {
-    cursor_ = 0;
-  }
-  delete iter;
-  
-  res_.AppendContent("*2");
+  int64_t next_cursor = 0;
+  std::vector<blackwidow::FieldValue> field_values;
+  rocksdb::Status s = g_pika_server->db()->HScan(key_, cursor_, pattern_, count_, &field_values, &next_cursor);
 
-  char buf[32];
-  int32_t len = slash::ll2string(buf, sizeof(buf), cursor_);
-  res_.AppendStringLen(len);
-  res_.AppendContent(buf);
+  if (s.ok() || s.IsNotFound()) {
+    res_.AppendContent("*2");
+    char buf[32];
+    int32_t len = slash::ll2string(buf, sizeof(buf), next_cursor);
+    res_.AppendStringLen(len);
+    res_.AppendContent(buf);
 
-  res_.AppendArrayLen(fv_v.size()*2);
-  std::vector<nemo::FV>::const_iterator iter_fv = fv_v.begin();
-  for (; iter_fv != fv_v.end(); iter_fv++) {
-    res_.AppendStringLen(iter_fv->field.size());
-    res_.AppendContent(iter_fv->field);
-    res_.AppendStringLen(iter_fv->val.size());
-    res_.AppendContent(iter_fv->val);
+    res_.AppendArrayLen(field_values.size()*2);
+    for (const auto& field_value : field_values) {
+      res_.AppendString(field_value.field);
+      res_.AppendString(field_value.value);
+    }
+  } else {
+    res_.SetRes(CmdRes::kErrOther, s.ToString());
+  }
+  return;
+}
+
+void HScanxCmd::DoInitial(PikaCmdArgsType &argv, const CmdInfo* const ptr_info) {
+  if (!ptr_info->CheckArg(argv.size())) {
+    res_.SetRes(CmdRes::kWrongNum, kCmdNameHScan);
+    return;
+  }
+  key_ = argv[1];
+  start_field_ = argv[2];
+
+  size_t index = 3, argc = argv.size();
+  while (index < argc) {
+    std::string opt = slash::StringToLower(argv[index]);
+    if (opt == "match" || opt == "count") {
+      index++;
+      if (index >= argc) {
+        res_.SetRes(CmdRes::kSyntaxErr);
+        return;
+      }
+      if (opt == "match") {
+        pattern_ = argv[index];
+      } else if (!slash::string2l(argv[index].data(), argv[index].size(), &count_)) {
+        res_.SetRes(CmdRes::kInvalidInt);
+        return;
+      }
+    } else {
+      res_.SetRes(CmdRes::kSyntaxErr);
+      return;
+    }
+    index++;
+  }
+  if (count_ < 0) {
+    res_.SetRes(CmdRes::kSyntaxErr);
+    return;
+  }
+  return;
+}
+
+void HScanxCmd::Do() {
+  std::string next_field;
+  std::vector<blackwidow::FieldValue> field_values;
+  rocksdb::Status s = g_pika_server->db()->HScanx(key_, start_field_, pattern_, count_, &field_values, &next_field);
+
+  if (s.ok() || s.IsNotFound()) {
+    res_.AppendArrayLen(2);
+    res_.AppendStringLen(next_field.size());
+    res_.AppendContent(next_field);
+
+    res_.AppendArrayLen(2 * field_values.size());
+    for (const auto& field_value : field_values) {
+      res_.AppendString(field_value.field);
+      res_.AppendString(field_value.value);
+    }
+  } else {
+    res_.SetRes(CmdRes::kErrOther, s.ToString());
+  }
+  return;
+}
+
+void PKHScanRangeCmd::DoInitial(PikaCmdArgsType &argv, const CmdInfo* const ptr_info) {
+  if (!ptr_info->CheckArg(argv.size())) {
+    res_.SetRes(CmdRes::kWrongNum, kCmdNamePKHScanRange);
+    return;
+  }
+  key_ = argv[1];
+  field_start_ = argv[2];
+  field_end_ = argv[3];
+
+  size_t index = 4, argc = argv.size();
+  while (index < argc) {
+    std::string opt = slash::StringToLower(argv[index]);
+    if (opt == "match" || opt == "limit") {
+      index++;
+      if (index >= argc) {
+        res_.SetRes(CmdRes::kSyntaxErr);
+        return;
+      }
+      if (opt == "match") {
+        pattern_ = argv[index];
+      } else if (!slash::string2l(argv[index].data(), argv[index].size(), &limit_) || limit_ <= 0) {
+        res_.SetRes(CmdRes::kInvalidInt);
+        return;
+      }
+    } else {
+      res_.SetRes(CmdRes::kSyntaxErr);
+      return;
+    }
+    index++;
+  }
+  return;
+}
+
+void PKHScanRangeCmd::Do() {
+  std::string next_field;
+  std::vector<blackwidow::FieldValue> field_values;
+  rocksdb::Status s = g_pika_server->db()->PKHScanRange(key_, field_start_, field_end_,
+          pattern_, limit_, &field_values, &next_field);
+
+  if (s.ok() || s.IsNotFound()) {
+    res_.AppendArrayLen(2);
+    res_.AppendString(next_field);
+
+    res_.AppendArrayLen(2 * field_values.size());
+    for (const auto& field_value : field_values) {
+      res_.AppendString(field_value.field);
+      res_.AppendString(field_value.value);
+    }
+  } else {
+    res_.SetRes(CmdRes::kErrOther, s.ToString());
+  }
+  return;
+}
+
+void PKHRScanRangeCmd::DoInitial(PikaCmdArgsType &argv, const CmdInfo* const ptr_info) {
+  if (!ptr_info->CheckArg(argv.size())) {
+    res_.SetRes(CmdRes::kWrongNum, kCmdNamePKHRScanRange);
+    return;
+  }
+  key_ = argv[1];
+  field_start_ = argv[2];
+  field_end_ = argv[3];
+
+  size_t index = 4, argc = argv.size();
+  while (index < argc) {
+    std::string opt = slash::StringToLower(argv[index]);
+    if (opt == "match" || opt == "limit") {
+      index++;
+      if (index >= argc) {
+        res_.SetRes(CmdRes::kSyntaxErr);
+        return;
+      }
+      if (opt == "match") {
+        pattern_ = argv[index];
+      } else if (!slash::string2l(argv[index].data(), argv[index].size(), &limit_) || limit_ <= 0) {
+        res_.SetRes(CmdRes::kInvalidInt);
+        return;
+      }
+    } else {
+      res_.SetRes(CmdRes::kSyntaxErr);
+      return;
+    }
+    index++;
+  }
+  return;
+}
+
+void PKHRScanRangeCmd::Do() {
+  std::string next_field;
+  std::vector<blackwidow::FieldValue> field_values;
+  rocksdb::Status s = g_pika_server->db()->PKHRScanRange(key_, field_start_, field_end_,
+          pattern_, limit_, &field_values, &next_field);
+
+  if (s.ok() || s.IsNotFound()) {
+    res_.AppendArrayLen(2);
+    res_.AppendString(next_field);
+
+    res_.AppendArrayLen(2 * field_values.size());
+    for (const auto& field_value : field_values) {
+      res_.AppendString(field_value.field);
+      res_.AppendString(field_value.value);
+    }
+  } else {
+    res_.SetRes(CmdRes::kErrOther, s.ToString());
   }
   return;
 }

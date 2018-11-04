@@ -20,6 +20,7 @@ class PikaBinlogSenderThread : public pink::Thread {
  public:
 
   PikaBinlogSenderThread(const std::string &ip, int port,
+                         int64_t sid,
                          slash::SequentialFile *queue,
                          uint32_t filenum, uint64_t con_offset);
 
@@ -27,6 +28,9 @@ class PikaBinlogSenderThread : public pink::Thread {
 
   uint32_t filenum() {
     return filenum_;
+  }
+  uint64_t con_offset() {
+    return con_offset_;
   }
 
   int trim();
@@ -37,12 +41,9 @@ class PikaBinlogSenderThread : public pink::Thread {
   Status Consume(std::string &scratch);
   unsigned int ReadPhysicalRecord(slash::Slice *fragment);
 
-  uint64_t con_offset_;
   uint32_t filenum_;
-
-  uint64_t initial_offset_;
+  uint64_t con_offset_;
   uint64_t last_record_offset_;
-  uint64_t end_of_buffer_offset_;
 
   slash::SequentialFile* queue_;
   char* const backing_store_;
@@ -50,6 +51,7 @@ class PikaBinlogSenderThread : public pink::Thread {
 
   std::string ip_;
   int port_;
+  int64_t sid_;
 
   int timeout_ms_;
   pink::PinkCli *cli_;

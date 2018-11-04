@@ -3,6 +3,7 @@
 // LICENSE file in the root directory of this source tree. An additional grant
 // of patent rights can be found in the PATENTS file in the same directory.
 
+#include <signal.h>
 #include <glog/logging.h>
 #include <sys/resource.h>
 
@@ -11,7 +12,6 @@
 #include "include/pika_command.h"
 #include "include/pika_conf.h"
 #include "include/pika_define.h"
-#include "include/pika_slot.h"
 #include "include/pika_version.h"
 
 #ifdef TCMALLOC_EXTENSION
@@ -119,7 +119,7 @@ static void usage()
 }
 
 int main(int argc, char *argv[]) {
-  if (argc < 2) {
+  if (argc != 2 && argc != 3) {
     usage();
     exit(-1);
   }
@@ -156,14 +156,14 @@ int main(int argc, char *argv[]) {
   PikaConfInit(path);
 
   rlimit limit;
-  if (getrlimit(RLIMIT_NOFILE,&limit) == -1) {
+  rlim_t maxfiles = g_pika_conf->maxclients() + PIKA_MIN_RESERVED_FDS;
+  if (getrlimit(RLIMIT_NOFILE, &limit) == -1) {
     LOG(WARNING) << "getrlimit error: " << strerror(errno);
-  } else if (limit.rlim_cur < static_cast<unsigned int>(g_pika_conf->maxclients() + PIKA_MIN_RESERVED_FDS)) {
+  } else if (limit.rlim_cur < maxfiles) {
     rlim_t old_limit = limit.rlim_cur;
-    rlim_t best_limit = g_pika_conf->maxclients() + PIKA_MIN_RESERVED_FDS;
-    limit.rlim_cur = best_limit > limit.rlim_max ? limit.rlim_max-1 : best_limit;
-    limit.rlim_max = best_limit > limit.rlim_max ? limit.rlim_max-1 : best_limit;
-    if (setrlimit(RLIMIT_NOFILE,&limit) != -1) {
+    limit.rlim_cur = maxfiles;
+    limit.rlim_max = maxfiles;
+    if (setrlimit(RLIMIT_NOFILE, &limit) != -1) {
       LOG(WARNING) << "your 'limit -n ' of " << old_limit << " is not enough for Redis to start. pika have successfully reconfig it to " << limit.rlim_cur;
     } else {
       LOG(FATAL) << "your 'limit -n ' of " << old_limit << " is not enough for Redis to start. pika can not reconfig it(" << strerror(errno) << "), do it by yourself";
@@ -180,7 +180,6 @@ int main(int argc, char *argv[]) {
   PikaGlogInit();
   PikaSignalSetup();
   InitCmdInfoTable();
-  InitCRC32Table();
 
   LOG(INFO) << "Server at: " << path;
   g_pika_server = new PikaServer();

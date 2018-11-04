@@ -56,7 +56,16 @@ int PikaConf::Load()
   if (root_connection_num_ < 0) {
       root_connection_num_ = 2;
   }
+
+  std::string swe;
+  GetConfStr("slowlog-write-errorlog", &swe);
+  slowlog_write_errorlog_ = swe == "yes" ? true : false;
+
   GetConfInt("slowlog-log-slower-than", &slowlog_log_slower_than_);
+  GetConfInt("slowlog-max-len", &slowlog_max_len_);
+  if (slowlog_max_len_ == 0) {
+    slowlog_max_len_ = 128;
+  }
   std::string user_blacklist;
   GetConfStr("userblacklist", &user_blacklist);
   SetUserBlackList(std::string(user_blacklist));
@@ -154,7 +163,7 @@ int PikaConf::Load()
   }
 
   // write_buffer_size
-  GetConfInt("write-buffer-size", &write_buffer_size_);
+  GetConfInt64("write-buffer-size", &write_buffer_size_);
   if (write_buffer_size_ <= 0 ) {
       write_buffer_size_ = 4194304; // 40M
   }
@@ -194,12 +203,47 @@ int PikaConf::Load()
     max_bytes_for_level_multiplier_ = 5;
   }
 
+  block_size_ = 4 * 1024;
+  GetConfInt64("block-size", &block_size_);
+  if (block_size_ <= 0) {
+    block_size_ = 4 * 1024;
+  }
+
+  block_cache_ = 8 * 1024 * 1024;
+  GetConfInt64("block-cache", &block_cache_);
+  if (block_cache_ < 0) {
+    block_cache_ = 8 * 1024 * 1024;
+  }
+
+  std::string sbc;
+  GetConfStr("share-block-cache", &sbc);
+  share_block_cache_ = (sbc == "yes") ? true : false;
+
+  std::string ciafb;
+  GetConfStr("cache-index-and-filter-blocks", &ciafb);
+  cache_index_and_filter_blocks_ = (ciafb == "yes") ? true : false;
+
+  std::string offh;
+  GetConfStr("optimize-filters-for-hits", &offh);
+  optimize_filters_for_hits_ = (offh == "yes") ? true : false;
+
+  std::string lcdlb;
+  GetConfStr("level-compaction-dynamic-level-bytes", &lcdlb);
+  level_compaction_dynamic_level_bytes_ = (lcdlb == "yes") ? true : false;
+
   // daemonize
   std::string dmz;
   GetConfStr("daemonize", &dmz);
   daemonize_ =  (dmz == "yes") ? true : false;
+
+  // binlog
+  std::string wb;
+  GetConfStr("write-binlog", &wb);
+  write_binlog_ = (wb == "no") ? false : true;
+  GetConfStr("identify-binlog-type", &identify_binlog_type_);
   GetConfInt("binlog-file-size", &binlog_file_size_);
-  if (binlog_file_size_ < 1024 || static_cast<int64_t>(binlog_file_size_) > (1024LL * 1024 * 1024)) {
+  if (binlog_file_size_ < 1024
+    || static_cast<int64_t>(binlog_file_size_) > (1024LL * 1024 * 1024)) {
     binlog_file_size_ = 100 * 1024 * 1024;    // 100M
   }
   GetConfStr("pidfile", &pidfile_);
@@ -229,6 +273,8 @@ int PikaConf::Load()
 }
 
 int PikaConf::ConfigRewrite() {
+  ReloadConf();
+
   SetConfInt("port", port_);
   SetConfInt("thread-num", thread_num_);
   SetConfInt("sync-thread-num", sync_thread_num_);
@@ -238,7 +284,7 @@ int PikaConf::ConfigRewrite() {
   SetConfStr("db-path", db_path_);
   SetConfStr("db-sync-path", db_sync_path_);
   SetConfInt("db-sync-speed", db_sync_speed_);
-  SetConfInt("write-buffer-size", write_buffer_size_);
+  SetConfInt64("write-buffer-size", write_buffer_size_);
   SetConfInt("timeout", timeout_);
   SetConfStr("server-id", server_id_);
   SetConfStr("requirepass", requirepass_);
@@ -256,7 +302,9 @@ int PikaConf::ConfigRewrite() {
   SetConfInt("expire-logs-days", expire_logs_days_);
   SetConfInt("expire-logs-nums", expire_logs_nums_);
   SetConfInt("root-connection-num", root_connection_num_);
+  SetConfStr("slowlog-write-errorlog", slowlog_write_errorlog_ ? "yes" : "no");
   SetConfInt("slowlog-log-slower-than", slowlog_log_slower_than_);
+  SetConfInt("slowlog-max-len", slowlog_max_len_);
   SetConfBool("slave-read-only", readonly_);
   SetConfStr("compact-cron", compact_cron_);
   SetConfStr("compact-interval", compact_interval_);
@@ -264,12 +312,20 @@ int PikaConf::ConfigRewrite() {
   SetConfStr("slaveof", slaveof_);
   SetConfInt("slave-priority", slave_priority_);
 
+  SetConfStr("write-binlog", write_binlog_ ? "yes" : "no");
   SetConfInt("binlog-file-size", binlog_file_size_);
+  SetConfStr("identify-binlog-type", identify_binlog_type_);
   SetConfStr("compression", compression_);
   SetConfInt("max-background-flushes", max_background_flushes_);
   SetConfInt("max-background-compactions", max_background_compactions_);
   SetConfInt("max-cache-files", max_cache_files_);
   SetConfInt("max-bytes-for-level-multiplier", max_bytes_for_level_multiplier_);
+  SetConfInt64("block-size", block_size_);
+  SetConfInt64("block-cache", block_cache_);
+  SetConfStr("share-block-cache", share_block_cache_ ? "yes" : "no");
+  SetConfStr("cache-index-and-filter-blocks", cache_index_and_filter_blocks_ ? "yes" : "no");
+  SetConfStr("optimize-filters-for-hits", optimize_filters_for_hits_ ? "yes" : "no");
+  SetConfStr("level-compaction-dynamic-level-bytes", level_compaction_dynamic_level_bytes_ ? "yes" : "no");
 
   return WriteBack();
 }

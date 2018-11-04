@@ -4,7 +4,7 @@
 
 ## Introduction[中文](https://github.com/Qihoo360/pika/blob/master/README_CN.md)
 
-Pika is a persistent huge storage service , compatible  with the vast majority of redis interfaces ([details](https://github.com/Qihoo360/pika/wiki/pika-支持的redis接口及兼容情况)), including string, hash, list, zset, set and management interfaces. With the huge amount of data stored, redis may suffer for a capacity bottleneck, and pika was born for solving it. Except huge storage capacity, pika also support master-slave mode by slaveof command, including full and partial synchronization. You can also use pika together with twemproxy or codis(*pika has supported data migration in codis，thanks [left2right](https://github.com/left2right)*) for distributed Redis solution
+Pika is a persistent huge storage service , compatible  with the vast majority of redis interfaces ([details](https://github.com/Qihoo360/pika/wiki/pika-支持的redis接口及兼容情况)), including string, hash, list, zset, set and management interfaces. With the huge amount of data stored, redis may suffer for a capacity bottleneck, and pika was born for solving it. Except huge storage capacity, pika also support master-slave mode by slaveof command, including full and partial synchronization. You can also use pika together with twemproxy or codis(*pika has supported data migration in codis，thanks [left2right](https://github.com/left2right) and [fancy-rabbit](https://github.com/fancy-rabbit)*) for distributed Redis solution
 
 
 ## UserList
@@ -12,7 +12,7 @@ Pika is a persistent huge storage service , compatible  with the vast majority o
 <table>
 <tr>
 <td height = "100" width = "150"><img src="http://i.imgur.com/dcHpCm4.png" alt="Qihoo"></td>
-<td height = "100" width = "150"><img src="http://i.imgur.com/ktPV3JU.jpg?2" alt="360game"></td>
+<td height = "100" width = "150"><img src="https://i.imgur.com/BIjqe9R.jpg" alt="360game"></td>
 <td height = "100" width = "150"><img src="http://i.imgur.com/jjZczkN.png" alt="Weibo"></td>
 <td height = "100" width = "150"><img src="http://i.imgur.com/zoel46r.gif" alt="Garena"></td>
 </tr>
@@ -52,9 +52,8 @@ Pika is a persistent huge storage service , compatible  with the vast majority o
 
 ## For developer
 
-### RoadMap
-
-* optimize engine nemo to improve list performance
+### Releases
+The User can download the binary release from [releases](https://github.com/Qihoo360/pika/releases) or compile the source release.
 
 ### Dependencies
 
@@ -321,6 +320,7 @@ Compare the pika max qps with the redis.
 Mail: g-infra-bada@360.cn
 
 QQ group: 294254078
+
 For more information about Pika, Atlas and some other technology please pay attention to our Hulk platform official account
 
 <img src="http://i.imgur.com/pL4ni57.png" height = "50%" width = "50%" alt="2">

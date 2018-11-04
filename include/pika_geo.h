@@ -6,8 +6,6 @@
 #ifndef PIKA_GEO_H_
 #define PIKA_GEO_H_
 #include "include/pika_command.h"
-#include "nemo.h"
-
 
 /*
  * zset
@@ -65,7 +63,7 @@ public:
   virtual void Do();
 private:
   std::string key_;
-  std::vector<std::string> member_;
+  std::vector<std::string> members_;
   virtual void DoInitial(PikaCmdArgsType &argvs, const CmdInfo* const ptr_info);
 };
 
@@ -84,7 +82,7 @@ public:
   virtual void Do();
 private:
   std::string key_;
-  std::vector<std::string> member_;
+  std::vector<std::string> members_;
   virtual void DoInitial(PikaCmdArgsType &argvs, const CmdInfo* const ptr_info);
 };
 

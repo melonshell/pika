@@ -5,7 +5,6 @@
 
 #include <vector>
 #include "slash/include/slash_string.h"
-#include "nemo.h"
 #include "include/pika_server.h"
 #include "include/pika_hyperloglog.h"
 
@@ -26,9 +25,8 @@ void PfAddCmd::DoInitial(PikaCmdArgsType &argv, const CmdInfo* const ptr_info) {
 }
 
 void PfAddCmd::Do() {
-  nemo::Status s;
   bool update = false;
-  s = g_pika_server->db()->PfAdd(key_, values_, update);
+  rocksdb::Status s = g_pika_server->db()->PfAdd(key_, values_, &update);
   if (s.ok() && update) {
     res_.AppendInteger(1);
   } else if (s.ok() && !update) {
@@ -50,9 +48,8 @@ void PfCountCmd::DoInitial(PikaCmdArgsType &argv, const CmdInfo* const ptr_info)
 }
 
 void PfCountCmd::Do() {
-  nemo::Status s;
-  int value_;
-  s = g_pika_server->db()->PfCount(keys_, value_);
+  int64_t value_ = 0;
+  rocksdb::Status s = g_pika_server->db()->PfCount(keys_, &value_);
   if (s.ok()) {
     res_.AppendInteger(value_);
   } else {
@@ -72,8 +69,7 @@ void PfMergeCmd::DoInitial(PikaCmdArgsType &argv, const CmdInfo* const ptr_info)
 }
 
 void PfMergeCmd::Do() {
-  nemo::Status s;
-  s = g_pika_server->db()->PfMerge(keys_);
+  rocksdb::Status s = g_pika_server->db()->PfMerge(keys_);
   if (s.ok()) {
     res_.SetRes(CmdRes::kOk);
   } else {

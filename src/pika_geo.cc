@@ -7,10 +7,8 @@
 #include <algorithm>
 
 #include "slash/include/slash_string.h"
-#include "nemo.h"
 #include "include/pika_geo.h"
 #include "include/pika_server.h"
-#include "include/pika_slot.h"
 #include "include/pika_geohash_helper.h"
 
 extern PikaServer *g_pika_server;
@@ -27,19 +25,18 @@ void GeoAddCmd::DoInitial(PikaCmdArgsType &argv, const CmdInfo* const ptr_info) 
   }
   key_ = argv[1];
   pos_.clear();
-  size_t index = 2;
-  for (; index < argc; index += 3) {
-    struct GeoPoint point;
-    double longitude, latitude;
+  struct GeoPoint point;
+  double longitude, latitude;
+  for (size_t index = 2; index < argc; index += 3) {
     if (!slash::string2d(argv[index].data(), argv[index].size(), &longitude)) {
       res_.SetRes(CmdRes::kInvalidFloat);
       return;
     }
-    if (!slash::string2d(argv[index+1].data(), argv[index+1].size(), &latitude)) {
+    if (!slash::string2d(argv[index + 1].data(), argv[index + 1].size(), &latitude)) {
       res_.SetRes(CmdRes::kInvalidFloat);
       return;
     }
-    point.member = argv[index+2];
+    point.member = argv[index + 2];
     point.longitude = longitude;
     point.latitude = latitude;
     pos_.push_back(point);
@@ -48,29 +45,25 @@ void GeoAddCmd::DoInitial(PikaCmdArgsType &argv, const CmdInfo* const ptr_info) 
 }
 
 void GeoAddCmd::Do() {
-  nemo::Status s;
-  int64_t count = 0, ret;
-  const std::shared_ptr<nemo::Nemo> db = g_pika_server->db();
-  std::vector<GeoPoint>::const_iterator iter = pos_.begin();
-  for (; iter != pos_.end(); iter++) {
+  std::vector<blackwidow::ScoreMember> score_members;
+  for (const auto& geo_point : pos_) {
     // Convert coordinates to geohash
     GeoHashBits hash;
-    geohashEncodeWGS84(iter->longitude, iter->latitude, GEO_STEP_MAX, &hash);
+    geohashEncodeWGS84(geo_point.longitude, geo_point.latitude, GEO_STEP_MAX, &hash);
     GeoHashFix52Bits bits = geohashAlign52Bits(hash);
     // Convert uint64 to double
     double score;
     std::string str_bits = std::to_string(bits);
     slash::string2d(str_bits.data(), str_bits.size(), &score);
-    s = db->ZAdd(key_, score, iter->member, &ret); 
-    if (s.ok()) {
-      count += ret;
-    } else {
-      res_.SetRes(CmdRes::kErrOther, s.ToString());
-      return;
-    }
+    score_members.push_back({score, geo_point.member});
   }
-  SlotKeyAdd("z", key_);
-  res_.AppendInteger(count);
+  int32_t count = 0;
+  rocksdb::Status s = g_pika_server->db()->ZAdd(key_, score_members, &count); 
+  if (s.ok()) {
+    res_.AppendInteger(count);
+  } else {
+    res_.SetRes(CmdRes::kErrOther, s.ToString());
+  }
   return;
 }
 
@@ -80,18 +73,18 @@ void GeoPosCmd::DoInitial(PikaCmdArgsType &argv, const CmdInfo* const ptr_info) 
     return;
   }
   key_ = argv[1];
-  member_.clear();
+  members_.clear();
   size_t pos = 2;
   while (pos < argv.size()) {
-    member_.push_back(argv[pos++]);
+    members_.push_back(argv[pos++]);
   }
 }
 
 void GeoPosCmd::Do() {
   double score;
-  res_.AppendArrayLen(member_.size());
-  for (auto v : member_) {
-    nemo::Status s = g_pika_server->db()->ZScore(key_, v, &score);
+  res_.AppendArrayLen(members_.size());
+  for (const auto& member : members_) {
+    rocksdb::Status s = g_pika_server->db()->ZScore(key_, member, &score);
     if (s.ok()) {
       double xy[2];
       GeoHashBits hash = { .bits = (uint64_t)score, .step = GEO_STEP_MAX };
@@ -168,7 +161,7 @@ void GeoDistCmd::DoInitial(PikaCmdArgsType &argv, const CmdInfo* const ptr_info)
 
 void GeoDistCmd::Do() {
   double first_score, second_score, first_xy[2], second_xy[2];
-  nemo::Status s = g_pika_server->db()->ZScore(key_, first_pos_, &first_score);
+  rocksdb::Status s = g_pika_server->db()->ZScore(key_, first_pos_, &first_score);
   if (s.ok()) {
     GeoHashBits hash = { .bits = (uint64_t)first_score, .step = GEO_STEP_MAX };
     geohashDecodeToLongLatWGS84(hash, first_xy);
@@ -206,19 +199,19 @@ void GeoHashCmd::DoInitial(PikaCmdArgsType &argv, const CmdInfo* const ptr_info)
     return;
   }
   key_ = argv[1];
-  member_.clear();
+  members_.clear();
   size_t pos = 2;
   while (pos < argv.size()) {
-    member_.push_back(argv[pos++]);
+    members_.push_back(argv[pos++]);
   }
 }
 
 void GeoHashCmd::Do() {
   const char * geoalphabet= "0123456789bcdefghjkmnpqrstuvwxyz";
-  res_.AppendArrayLen(member_.size());
-  for (auto v : member_) {
+  res_.AppendArrayLen(members_.size());
+  for (const auto& member : members_) {
     double score;
-    nemo::Status s = g_pika_server->db()->ZScore(key_, v, &score);
+    rocksdb::Status s = g_pika_server->db()->ZScore(key_, member, &score);
     if (s.ok()) {
       double xy[2];
       GeoHashBits hash = { .bits = (uint64_t)score, .step = GEO_STEP_MAX };
@@ -260,7 +253,7 @@ static bool sort_distance_desc(const NeighborPoint & pos1, const NeighborPoint &
 }
 
 static void GetAllNeighbors(std::string & key, GeoRange & range, CmdRes & res) {
-  nemo::Status s;
+  rocksdb::Status s;
   double longitude = range.longitude, latitude = range.latitude, distance = range.distance;
   int count_limit = 0;
   // Convert other units to meters
@@ -304,21 +297,21 @@ static void GetAllNeighbors(std::string & key, GeoRange & range, CmdRes & res) {
     if(last_processed && neighbors[i].bits == neighbors[last_processed].bits && neighbors[i].step == neighbors[last_processed].step) {
 	continue;
     }
-    std::vector<nemo::SM> sm_v;
-    s = g_pika_server->db()->ZRangebyscore(key, (double)min, (double)max, sm_v, false, false);
-    if (!s.ok()) {
+    std::vector<blackwidow::ScoreMember> score_members;
+    s = g_pika_server->db()->ZRangebyscore(key, (double)min, (double)max, true, true, &score_members);
+    if (!s.ok() && !s.IsNotFound()) {
       res.SetRes(CmdRes::kErrOther, s.ToString());
       return;
     }
     // Insert into result only if the point is within the search area.
-    for (size_t i = 0; i < sm_v.size(); ++i) {
+    for (size_t i = 0; i < score_members.size(); ++i) {
       double xy[2], real_distance;
-      GeoHashBits hash = { .bits = (uint64_t)sm_v[i].score, .step = GEO_STEP_MAX };
+      GeoHashBits hash = { .bits = (uint64_t)score_members[i].score, .step = GEO_STEP_MAX };
       geohashDecodeToLongLatWGS84(hash, xy);
       if(geohashGetDistanceIfInRadiusWGS84(longitude, latitude, xy[0], xy[1], distance, &real_distance)) {
         NeighborPoint item;
-        item.member = sm_v[i].member;
-        item.score = sm_v[i].score;
+        item.member = score_members[i].member;
+        item.score = score_members[i].score;
         item.distance = real_distance;
         result.push_back(item);
       }
@@ -341,16 +334,17 @@ static void GetAllNeighbors(std::string & key, GeoRange & range, CmdRes & res) {
   
   if (range.store || range.storedist) {
     // Target key, create a sorted set with the results.
-    const std::shared_ptr<nemo::Nemo> db = g_pika_server->db();
-    int64_t ret;
+    std::vector<blackwidow::ScoreMember> score_members;
     for (int i = 0; i < count_limit; ++i) {
       double distance = length_converter(result[i].distance, range.unit);
-      double score = range.store ? result[i].score : distance; 
-      s = db->ZAdd(range.storekey, score, result[i].member, &ret); 
-      if (!s.ok()) {
-        res.SetRes(CmdRes::kErrOther, s.ToString());
-        return;
-      }
+      double score = range.store ? result[i].score : distance;
+      score_members.push_back({score, result[i].member});
+    }
+    int32_t count = 0;
+    s = g_pika_server->db()->ZAdd(range.storekey, score_members, &count); 
+    if (!s.ok()) {
+      res.SetRes(CmdRes::kErrOther, s.ToString());
+      return;
     }
     res.AppendInteger(count_limit);
     return;
@@ -374,10 +368,14 @@ static void GetAllNeighbors(std::string & key, GeoRange & range, CmdRes & res) {
         geohashDecodeToLongLatWGS84(hash, xy);
         double distance = geohashGetDistance(longitude, latitude, xy[0], xy[1]);
         distance = length_converter(distance, range.unit);
-	char buf[32];
-	sprintf(buf, "%.4f", distance);
-	res.AppendStringLen(strlen(buf));
+        char buf[32];
+        sprintf(buf, "%.4f", distance);
+        res.AppendStringLen(strlen(buf));
         res.AppendContent(buf);
+      }
+      // If using withhash option
+      if (range.withhash) {
+        res.AppendInteger(result[i].score);
       }
       // If using withcoord option
       if (range.withcoord) {
@@ -395,13 +393,6 @@ static void GetAllNeighbors(std::string & key, GeoRange & range, CmdRes & res) {
         len = slash::d2string(latitude, sizeof(latitude), xy[1]);
         res.AppendStringLen(len);
         res.AppendContent(latitude);
-      }
-      // If using withhash option
-      if (range.withhash) {
-        char buf[32];
-        int64_t len = slash::d2string(buf, sizeof(buf), result[i].score);
-        res.AppendStringLen(len);
-        res.AppendContent(buf);
       }
     }
   }
@@ -549,9 +540,8 @@ void GeoRadiusByMemberCmd::DoInitial(PikaCmdArgsType &argv, const CmdInfo* const
 }
 
 void GeoRadiusByMemberCmd::Do() {
-  nemo::Status s;
   double score;
-  s = g_pika_server->db()->ZScore(key_, range_.member, &score);
+  rocksdb::Status s = g_pika_server->db()->ZScore(key_, range_.member, &score);
   if (s.ok()) {
     double xy[2];
     GeoHashBits hash = { .bits = (uint64_t)score, .step = GEO_STEP_MAX };

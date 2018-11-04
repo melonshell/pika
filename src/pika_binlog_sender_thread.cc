@@ -17,18 +17,18 @@
 extern PikaServer* g_pika_server;
 
 PikaBinlogSenderThread::PikaBinlogSenderThread(const std::string &ip, int port,
+                                               int64_t sid,
                                                slash::SequentialFile *queue,
                                                uint32_t filenum,
                                                uint64_t con_offset)
-    : con_offset_(con_offset),
-      filenum_(filenum),
-      initial_offset_(0),
-      end_of_buffer_offset_(kBlockSize),
+    : filenum_(filenum),
+      con_offset_(con_offset),
       queue_(queue),
       backing_store_(new char[kBlockSize]),
       buffer_(),
       ip_(ip),
       port_(port),
+      sid_(sid),
       timeout_ms_(35000) {
   cli_ = pink::NewRedisCli();
   last_record_offset_ = con_offset % kBlockSize;
@@ -111,9 +111,9 @@ uint64_t PikaBinlogSenderThread::get_next(bool &is_error) {
 
 unsigned int PikaBinlogSenderThread::ReadPhysicalRecord(slash::Slice *result) {
   slash::Status s;
-  if (end_of_buffer_offset_ - last_record_offset_ <= kHeaderSize) {
-    queue_->Skip(end_of_buffer_offset_ - last_record_offset_);
-    con_offset_ += (end_of_buffer_offset_ - last_record_offset_);
+  if (kBlockSize - last_record_offset_ <= kHeaderSize) {
+    queue_->Skip(kBlockSize - last_record_offset_);
+    con_offset_ += (kBlockSize - last_record_offset_);
     last_record_offset_ = 0;
   }
   buffer_.clear();
@@ -148,9 +148,6 @@ unsigned int PikaBinlogSenderThread::ReadPhysicalRecord(slash::Slice *result) {
 
 Status PikaBinlogSenderThread::Consume(std::string &scratch) {
   Status s;
-  if (last_record_offset_ < initial_offset_) {
-    return slash::Status::IOError("last_record_offset exceed");
-  }
 
   slash::Slice fragment;
   while (true) {
@@ -225,9 +222,7 @@ Status PikaBinlogSenderThread::Parse(std::string &scratch) {
 
         filenum_++;
         con_offset_ = 0;
-        initial_offset_ = 0;
-        end_of_buffer_offset_ = kBlockSize;
-        last_record_offset_ = con_offset_ % kBlockSize;
+        last_record_offset_ = 0;
       } else {
         usleep(10000);
       }
@@ -246,19 +241,35 @@ Status PikaBinlogSenderThread::Parse(std::string &scratch) {
 void* PikaBinlogSenderThread::ThreadMain() {
   Status s, result;
   bool last_send_flag = true;
-  std::string scratch;
+  std::string header, scratch, transfer;
   scratch.reserve(1024 * 1024);
 
   while (!should_stop()) {
     sleep(2);
     // 1. Connect to slave
-    result = cli_->Connect(ip_, port_, g_pika_server->host());
+    result = cli_->Connect(ip_, port_, "");
     LOG(INFO) << "BinlogSender Connect slave(" << ip_ << ":" << port_ << ") " << result.ToString();
 
+    // 2. Auth
     if (result.ok()) {
       cli_->set_send_timeout(timeout_ms_);
+      // Auth sid
+      std::string auth_cmd;
+      pink::RedisCmdArgsType argv;
+      argv.push_back("auth");
+      argv.push_back(std::to_string(sid_));
+      pink::SerializeRedisCommand(argv, &auth_cmd);
+      header.clear();
+      slash::PutFixed16(&header, TransferOperate::kTypeAuth);
+      slash::PutFixed32(&header, auth_cmd.size());
+      transfer = header + auth_cmd;
+      result = cli_->Send(&transfer);
+      if (!result.ok()) {
+        LOG(WARNING) << "BinlogSender send slave(" << ip_ << ":" << port_ << ") failed,  " << result.ToString();
+        break;
+      }
       while (true) {
-        // 2. Should Parse new msg;
+        // 3. Should Parse new msg;
         if (last_send_flag) {
           s = Parse(scratch);
           //DLOG(INFO) << "BinlogSender Parse, return " << s.ToString();
@@ -274,24 +285,24 @@ void* PikaBinlogSenderThread::ThreadMain() {
         }
 
         // Parse binlog
-        std::vector<std::string> items;
-        std::string token, delimiter = "\r\n", scratch_copy = scratch;
-        size_t pos = 0;
-        while ((pos = scratch_copy.find(delimiter)) != std::string::npos) {
-          token = scratch_copy.substr(0, pos);
-          items.push_back(token);
-          scratch_copy.erase(0, pos + delimiter.length());
-        }
-        items.push_back(scratch_copy);
-        std::string binlog_sid = items[items.size() - 6];
+        BinlogItem binlog_item;
+        PikaBinlogTransverter::BinlogDecode(BinlogType::TypeFirst,
+                                            scratch,
+                                            &binlog_item);
 
         // If this binlog from the peer-master, can not resend to the peer-master
-        if (std::atoi(binlog_sid.c_str()) == g_pika_server->DoubleMasterSid() && ip_ == g_pika_server->master_ip() && port_ == (g_pika_server->master_port()+1000)) {
+        if (binlog_item.server_id() == g_pika_server->DoubleMasterSid()
+          && ip_ == g_pika_server->master_ip()
+          && port_ == (g_pika_server->master_port() + 1000)) {
           continue;
         }
 
-        // 3. After successful parse, we send msg;
-        result = cli_->Send(&scratch);
+        // 4. After successful parse, we send msg;
+        header.clear();
+        slash::PutFixed16(&header, TransferOperate::kTypeBinlog);
+        slash::PutFixed32(&header, scratch.size());
+        transfer = header + scratch;
+        result = cli_->Send(&transfer);
         if (result.ok()) {
           last_send_flag = true;
         } else {

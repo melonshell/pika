@@ -11,26 +11,24 @@
 #include <map>
 #include <unordered_set>
 #include <sys/statfs.h>
-#include <nemo.h>
 #include <time.h>
 
 #include "include/pika_binlog.h"
 #include "include/pika_binlog_receiver_thread.h"
 #include "include/pika_binlog_sender_thread.h"
-#include "include/pika_hub_manager.h"
 #include "include/pika_heartbeat_thread.h"
 #include "include/pika_slaveping_thread.h"
 #include "include/pika_trysync_thread.h"
 #include "include/pika_monitor_thread.h"
 #include "include/pika_define.h"
 #include "include/pika_binlog_bgworker.h"
-#include "include/pika_slot.h"
 
 #include "slash/include/slash_status.h"
 #include "slash/include/slash_mutex.h"
 #include "pink/include/bg_thread.h"
 #include "pink/include/pink_pubsub.h"
-#include "nemo_backupable.h"
+#include "blackwidow/blackwidow.h"
+#include "blackwidow/backupable.h"
 
 using slash::Status;
 using slash::Slice;
@@ -70,10 +68,18 @@ class PikaServer {
   int master_port() {
     return master_port_;
   }
-  const std::shared_ptr<nemo::Nemo> db() {
-    return db_;
+
+  int64_t sid() {
+    return sid_;
   }
 
+  void SetSid(int64_t sid) {
+    sid_ = sid;
+  }
+
+  const std::shared_ptr<blackwidow::BlackWidow> db() {
+    return db_;
+  }
 
   int role() {
     slash::RWLock(&state_protector_, false);
@@ -82,6 +88,25 @@ class PikaServer {
   int repl_state() {
     slash::RWLock(&state_protector_, false);
     return repl_state_;
+  }
+  std::string repl_state_str() {
+    slash::RWLock(&state_protector_, false);
+    switch (repl_state_) {
+      case PIKA_REPL_NO_CONNECT:
+        return "no connect";
+      case PIKA_REPL_CONNECT:
+        return "connect";
+      case PIKA_REPL_CONNECTING:
+        return "connecting";
+      case PIKA_REPL_CONNECTED:
+        return "connected";
+      case PIKA_REPL_WAIT_DBSYNC:
+        return "wait dbsync";
+      case PIKA_REPL_ERROR:
+        return "error";
+      default:
+        return "";
+    }
   }
   bool force_full_sync() {
     return force_full_sync_;
@@ -165,26 +190,22 @@ class PikaServer {
   PikaSlavepingThread* ping_thread_;
 
   /*
-   * Hub use
-   */
-  PikaHubManager* pika_hub_manager_;
-
-  /*
    * Server init info
    */
   bool ServerInit();
 
   /*
-   * Nemo options init
+   * Blackwidow options init
    */
-  void NemoOptionInit(nemo::Options* option);
+  void RocksdbOptionInit(blackwidow::BlackwidowOptions* bw_option);
 
   /*
    * Binlog
    */
   Binlog *logger_;
   Status AddBinlogSender(const std::string& ip, int64_t port,
-      uint32_t filenum, uint64_t con_offset);
+                         int64_t sid,
+                         uint32_t filenum, uint64_t con_offset);
 
   /*
    * BGSave used
@@ -220,114 +241,6 @@ class PikaServer {
     bgsave_info_.bgsaving = false;
   }
 
-
-  /*
-   * BGSlotsReload used
-   */
-  struct BGSlotsReload {
-    bool reloading;
-    time_t start_time;
-    std::string s_start_time;
-    int64_t cursor;
-    std::string pattern;
-    int64_t count;
-    BGSlotsReload() : reloading(false), cursor(0), pattern("*"), count(100){}
-    void Clear() {
-      reloading = false;
-      pattern = "*";
-      count = 100;
-      cursor = 0;
-    }
-  };
-  BGSlotsReload bgslots_reload() {
-    slash::MutexLock l(&bgsave_protector_);
-    return bgslots_reload_;
-  }
-  bool GetSlotsreloading() {
-    slash::MutexLock l(&bgsave_protector_);
-    return bgslots_reload_.reloading;
-  }
-  void SetSlotsreloading(bool reloading) {
-    slash::MutexLock l(&bgsave_protector_);
-    bgslots_reload_.reloading = reloading;
-  }
-  void SetSlotsreloadingCursor(int64_t cursor) {
-    slash::MutexLock l(&bgsave_protector_);
-    bgslots_reload_.cursor = cursor;
-  }
-  int64_t GetSlotsreloadingCursor() {
-    slash::MutexLock l(&bgsave_protector_);
-    return bgslots_reload_.cursor;
-  }
-  void Bgslotsreload();
-  void StopBgslotsreload() {
-    slash::MutexLock l(&bgsave_protector_);
-    bgslots_reload_.reloading = false;
-  }
-
-/*
- * BGSlotsCleanup used
- */
-  struct BGSlotsCleanup {
-    bool cleanuping;
-    time_t start_time;
-    std::string s_start_time;
-    int64_t cursor;
-    std::string pattern;
-    int64_t count;
-    std::vector<int> cleanup_slots;
-    BGSlotsCleanup() : cleanuping(false), cursor(0), pattern("*"), count(100){}
-    void Clear() {
-      cleanuping = false;
-      pattern = "*";
-      count = 100;
-      cursor = 0;
-    }
-  };
-  BGSlotsCleanup bgslots_cleanup() {
-    slash::MutexLock l(&bgsave_protector_);
-    return bgslots_cleanup_;
-  }
-  bool GetSlotscleanuping() {
-    slash::MutexLock l(&bgsave_protector_);
-    return bgslots_cleanup_.cleanuping;
-  }
-  void SetSlotscleanuping(bool cleanuping) {
-    slash::MutexLock l(&bgsave_protector_);
-    bgslots_cleanup_.cleanuping = cleanuping;
-  }
-  void SetSlotscleanupingCursor(int64_t cursor) {
-    slash::MutexLock l(&bgsave_protector_);
-    bgslots_cleanup_.cursor = cursor;
-  }
-  int64_t GetSlotscleanupingCursor() {
-    slash::MutexLock l(&bgsave_protector_);
-    return bgslots_cleanup_.cursor;
-  }
-  void SetCleanupSlots(std::vector<int> cleanup_slots) {
-    slash::MutexLock l(&bgsave_protector_);
-    bgslots_cleanup_.cleanup_slots.swap(cleanup_slots);
-  }
-  std::vector<int> GetCleanupSlots() {
-    slash::MutexLock l(&bgsave_protector_);
-    return bgslots_cleanup_.cleanup_slots;
-  }
-  void Bgslotscleanup(std::vector<int> cleanup_slots);
-  void StopBgslotscleanup() {
-    slash::MutexLock l(&bgsave_protector_);
-    bgslots_cleanup_.cleanuping = false;
-    std::vector<int> cleanup_slots;
-    bgslots_cleanup_.cleanup_slots.swap(cleanup_slots);
-  }
-
-  /*
-   * SlotsMgrt used
-   */
-  int SlotsMigrateOne(const std::string &key);
-  bool SlotsMigrateBatch(const std::string &ip, int64_t port, int64_t time_out, int64_t slot, int64_t keys_num);
-  bool GetSlotsMigrateResul(int64_t *moved, int64_t *remained);
-  void GetSlotsMgrtSenderStatus(std::string *ip, int64_t *port, int64_t *slot, bool *migrating, int64_t *moved, int64_t *remained);
-  bool SlotsMigrateAsyncCancel();
 
   /*
    * PurgeLog used
@@ -436,18 +349,28 @@ class PikaServer {
   /*
    * Binlog Receiver use
    */
-  void DispatchBinlogBG(const std::string &key,
-      PikaCmdArgsType* argv, uint64_t cur_serial, bool readonly);
+  void DispatchBinlogBG(const std::string &key, PikaCmdArgsType* argv,
+          BinlogItem* binlog_item, uint64_t cur_serial, bool readonly);
   bool WaitTillBinlogBGSerial(uint64_t my_serial);
   void SignalNextBinlogBGSerial();
 
   /*
+   * Slowlog use
+   */
+  void SlowlogTrim();
+  void SlowlogReset();
+  uint32_t SlowlogLen();
+  void SlowlogObtain(int64_t number, std::vector<SlowlogEntry>* slowlogs);
+  void SlowlogPushEntry(const PikaCmdArgsType& argv, int32_t time, int64_t duration);
+
+  /*
    *for statistic
    */
-  void PlusThreadQuerynum();
   uint64_t ServerQueryNum();
   uint64_t ServerCurrentQps();
+  std::unordered_map<std::string, uint64_t> ServerExecCountTable();
   void ResetLastSecQuerynum(); /* Invoked in PikaDispatchThread's CronHandle */
+  void UpdateQueryNumAndExecCountTable(const std::string& command);
   uint64_t accumulative_connections() {
     return statistic_data_.accumulative_connections;
   }
@@ -457,13 +380,15 @@ class PikaServer {
   void ResetStat();
   slash::RecordMutex mutex_record_;
 
+  void SetDispatchQueueLimit(int queue_limit);
+
  private:
   std::atomic<bool> exit_;
   std::atomic<bool> binlog_io_error_;
   std::string host_;
   int port_;
   pthread_rwlock_t rwlock_;
-  std::shared_ptr<nemo::Nemo> db_;
+  std::shared_ptr<blackwidow::BlackWidow> db_;
 
   time_t start_time_s_;
   bool have_scheduled_crontask_;
@@ -502,7 +427,7 @@ class PikaServer {
    */
   slash::Mutex bgsave_protector_;
   pink::BGThread bgsave_thread_;
-  nemo::BackupEngine *bgsave_engine_;
+  blackwidow::BackupEngine *bgsave_engine_;
   BGSaveInfo bgsave_info_;
 
   static void DoBgsave(void* arg);
@@ -512,27 +437,6 @@ class PikaServer {
     slash::MutexLock l(&bgsave_protector_);
     bgsave_info_.Clear();
   }
-
-  /*
-   * BGSlotsReload use
-   */
-  BGSlotsReload bgslots_reload_;
-  pink::BGThread bgslots_reload_thread_;
-  static void DoBgslotsreload(void* arg);
-
-  /*
-   * BGSlotsCleanup use
-   */
-  BGSlotsCleanup bgslots_cleanup_;
-  pink::BGThread bgslots_cleanup_thread_;
-  static void DoBgslotscleanup(void* arg);
-
-  /*
-   * SlotsMgrt use
-   */
-  //slash::Mutex slotsmgrt_protector_;
-  SlotsMgrtSenderThread* slotsmgrt_sender_thread_;
-
 
   /*
    * Purgelogs use
@@ -560,6 +464,7 @@ class PikaServer {
    * Flushall use
    */
   static void DoPurgeDir(void* arg);
+
   /*
    * Keyscan use
    */
@@ -587,6 +492,12 @@ class PikaServer {
   std::vector<BinlogBGWorker*> binlogbg_workers_;
   std::hash<std::string> str_hash;
 
+  /*
+   * Slowlog use
+   */
+  pthread_rwlock_t slowlog_protector_;
+  uint64_t slowlog_entry_id_;
+  std::list<SlowlogEntry> slowlog_list_;
 
   /*
    * for statistic
@@ -602,6 +513,7 @@ class PikaServer {
 
     slash::RWMutex statistic_lock;
     std::atomic<uint64_t> accumulative_connections;
+    std::unordered_map<std::string, uint64_t> exec_count_table;
     uint64_t thread_querynum;
     uint64_t last_thread_querynum;
     uint64_t last_sec_thread_querynum;

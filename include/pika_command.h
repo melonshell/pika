@@ -14,13 +14,14 @@
 #include "slash/include/slash_string.h"
 #include "pink/include/redis_conn.h"
 
+#include "include/pika_binlog_transverter.h"
+
 const std::string kPikaBinlogMagic = "__PIKA_X#$SKGI";
 
 //Constant for command name
 //Admin
 const std::string kCmdNameSlaveof = "slaveof";
 const std::string kCmdNameTrysync = "trysync";
-const std::string kCmdNameInternalTrysync = "internaltrysync";
 const std::string kCmdNameAuth = "auth";
 const std::string kCmdNameBgsave = "bgsave";
 const std::string kCmdNameBgsaveoff = "bgsaveoff";
@@ -39,6 +40,9 @@ const std::string kCmdNameMonitor = "monitor";
 const std::string kCmdNameDbsize = "dbsize";
 const std::string kCmdNameTime = "time";
 const std::string kCmdNameDelbackup = "delbackup";
+const std::string kCmdNameEcho = "echo";
+const std::string kCmdNameScandb = "scandb";
+const std::string kCmdNameSlowlog = "slowlog";
 #ifdef TCMALLOC_EXTENSION
 const std::string kCmdNameTcmalloc = "tcmalloc";
 #endif
@@ -77,6 +81,8 @@ const std::string kCmdNameMget = "mget";
 const std::string kCmdNameKeys = "keys";
 const std::string kCmdNameSetnx = "setnx";
 const std::string kCmdNameSetex = "setex";
+const std::string kCmdNamePsetex = "psetex";
+const std::string kCmdNameDelvx = "delvx";
 const std::string kCmdNameMset = "mset";
 const std::string kCmdNameMsetnx = "msetnx";
 const std::string kCmdNameGetrange = "getrange";
@@ -92,6 +98,10 @@ const std::string kCmdNamePttl = "pttl";
 const std::string kCmdNamePersist = "persist";
 const std::string kCmdNameType = "type";
 const std::string kCmdNameScan = "scan";
+const std::string kCmdNameScanx = "scanx";
+const std::string kCmdNamePKScanRange = "pkscanrange";
+const std::string kCmdNamePKRScanRange = "pkrscanrange";
+
 //Hash
 const std::string kCmdNameHDel = "hdel";
 const std::string kCmdNameHSet = "hset";
@@ -108,6 +118,9 @@ const std::string kCmdNameHSetnx = "hsetnx";
 const std::string kCmdNameHStrlen = "hstrlen";
 const std::string kCmdNameHVals = "hvals";
 const std::string kCmdNameHScan = "hscan";
+const std::string kCmdNameHScanx = "hscanx";
+const std::string kCmdNamePKHScanRange = "pkhscanrange";
+const std::string kCmdNamePKHRScanRange = "pkhrscanrange";
 
 //List
 const std::string kCmdNameLIndex = "lindex";
@@ -272,7 +285,7 @@ private:
 };
 
 void inline RedisAppendContent(std::string& str, const std::string& value);
-void inline RedisAppendLen(std::string& str, int ori, const std::string &prefix);
+void inline RedisAppendLen(std::string& str, int64_t ori, const std::string &prefix);
 
 const std::string kNewLine = "\r\n";
 
@@ -340,7 +353,7 @@ public:
     case kInvalidBitPosArgument:
       return "-ERR The bit argument must be 1 or 0.\r\n";
     case kInvalidFloat:
-      return "-ERR value is not an float\r\n";
+      return "-ERR value is not a valid float\r\n";
     case kOverFlow:
       return "-ERR increment or decrement would overflow\r\n";
     case kNotFound:
@@ -378,13 +391,13 @@ public:
   }
 
   // Inline functions for Create Redis protocol
-  void AppendStringLen(int ori) {
+  void AppendStringLen(int64_t ori) {
     RedisAppendLen(message_, ori, "$");
   }
-  void AppendArrayLen(int ori) {
+  void AppendArrayLen(int64_t ori) {
     RedisAppendLen(message_, ori, "*");
   }
-  void AppendInteger(int ori) {
+  void AppendInteger(int64_t ori) {
     RedisAppendLen(message_, ori, ":");
   }
   void AppendContent(const std::string &value) {
@@ -426,47 +439,33 @@ class Cmd {
     return res_;
   }
 
-  virtual std::string ToBinlog(
-      const PikaCmdArgsType& argv,
-      const std::string& server_id,
-      const std::string& binlog_info,
-      bool need_send_to_hub) {
-    std::string res;
-    res.reserve(RAW_ARGS_LEN);
-    RedisAppendLen(res, argv.size() + 4, "*");
+  virtual std::string ToBinlog(const PikaCmdArgsType& argv,
+                               uint32_t exec_time,
+                               const std::string& server_id,
+                               uint64_t logic_id,
+                               uint32_t filenum,
+                               uint64_t offset) {
+    std::string content;
+    content.reserve(RAW_ARGS_LEN);
+    RedisAppendLen(content, argv.size(), "*");
 
-    for (auto& v : argv) {
-      RedisAppendLen(res, v.size(), "$");
-      RedisAppendContent(res, v);
+    for (const auto& v : argv) {
+      RedisAppendLen(content, v.size(), "$");
+      RedisAppendContent(content, v);
     }
 
-    AppendAffiliatedInfo(res, server_id, binlog_info, need_send_to_hub);
-
-    return res;
+    return PikaBinlogTransverter::BinlogEncode(BinlogType::TypeFirst,
+                                               exec_time,
+                                               std::stoi(server_id),
+                                               logic_id,
+                                               filenum,
+                                               offset,
+                                               content,
+                                               {});
   }
 
  protected:
   CmdRes res_;
-
-  void AppendAffiliatedInfo(
-      std::string& res,
-      const std::string& server_id,
-      const std::string& binlog_info,
-      bool need_send_to_hub) {
-    // kPikaBinlogMagic
-    RedisAppendLen(res, kPikaBinlogMagic.size(), "$");
-    RedisAppendContent(res, kPikaBinlogMagic);
-    // server_id
-    RedisAppendLen(res, server_id.size(), "$");
-    RedisAppendContent(res, server_id);
-    // binlog_info
-    RedisAppendLen(res, binlog_info.size(), "$");
-    RedisAppendContent(res, binlog_info);
-    // need_send_to_hub
-    std::string v = need_send_to_hub ? "1" : "0";
-    RedisAppendLen(res, v.size(), "$");
-    RedisAppendContent(res, v);
-  }
 
  private:
   virtual void DoInitial(PikaCmdArgsType &argvs, const CmdInfo* const ptr_info) = 0;
@@ -493,7 +492,7 @@ void RedisAppendContent(std::string& str, const std::string& value) {
   str.append(kNewLine);
 }
 
-void RedisAppendLen(std::string& str, int ori, const std::string &prefix) {
+void RedisAppendLen(std::string& str, int64_t ori, const std::string &prefix) {
   char buf[32];
   slash::ll2string(buf, 32, static_cast<long long>(ori));
   str.append(prefix);
